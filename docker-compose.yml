@@ -1,19 +1,43 @@
+# grok2api Docker Compose 部署编排。
+# 不需要 .env 文件：所有配置都以字面量写在下方注释清楚，按需修改即可。
+#
+# 首次部署步骤：
+#   1. 复制配置模板：cp config.example.yaml config.yaml
+#      并修改其中标记 [必须修改] 的项（jwtSecret、credentialEncryptionKey、管理员密码）。
+#   2. 启动：docker compose up -d
+#   3. 访问：http://<宿主机IP>:8000
+#
+# 常用命令：
+#   查看日志：docker compose logs -f grok2api
+#   升级镜像：docker compose pull && docker compose up -d
+
 name: grok2api
 
 services:
   grok2api:
     container_name: grok2api
-    image: "${GROK2API_IMAGE:-ghcr.io/chenyme/grok2api:latest}"
+    # CI 在推送 v* tag 时自动构建并推送的多平台镜像（linux/amd64 + linux/arm64）。
+    # latest 跟随最近一次 v* tag；也可固定版本，如 ghcr.io/mintiang/grok2api:v3.2.0
+    # 首次拉取前记得在 GitHub 仓库 Packages 设置中把镜像改为 Public（默认私有）。
+    image: ghcr.io/mintiang/grok2api:latest
     ports:
-      - "${GROK2API_PORT:-8000}:8000"
+      # 宿主机端口:容器端口；容器内固定监听 8000，一般只改左侧宿主机端口。
+      - "8000:8000"
     environment:
+      # 时区，影响日志时间与定时任务。也可在启动时临时覆盖：TZ=UTC docker compose up -d
       TZ: "${TZ:-Asia/Shanghai}"
-      # 非空时覆盖 config.yaml 的 PostgreSQL DSN，并自动启用 postgres。
+      # 可选：改用外部 PostgreSQL。启动时注入即可（无需 .env）：
+      #   GROK2API_DATABASE_URL='postgres://user:password@host:5432/grok2api?sslmode=require' docker compose up -d
+      # 非空时会覆盖 config.yaml 的 database.postgres.dsn 并自动启用 postgres；空值不覆盖。
       GROK2API_DATABASE_URL: "${GROK2API_DATABASE_URL:-}"
+      # 出口质量守护状态目录，与可选 sidecar（下方 quality-guard profile）共享卷，通常不要修改。
       GROK2API_QUALITY_GUARD_DIR: /var/lib/grok2api-quality-guard
     volumes:
-      - "${GROK2API_CONFIG:-./config.yaml}:/run/grok2api/config.yaml:ro"
+      # 必需：主配置文件（只读挂载）。首次部署执行 cp config.example.yaml config.yaml。
+      - ./config.yaml:/run/grok2api/config.yaml:ro
+      # 持久化：SQLite 数据库与媒体文件。使用外部 PostgreSQL 时该卷仅存媒体文件。
       - grok2api-data:/app/data
+      # 出口质量守护状态（可选功能）。
       - quality_guard_state:/var/lib/grok2api-quality-guard
     restart: unless-stopped
     init: true
@@ -63,9 +87,8 @@ services:
       context: .
       dockerfile: tools/egress-quality-guard/Dockerfile
     environment:
-      # Default matches the Compose service name. Override for host networking
-      # or a renamed grok2api service, e.g. http://127.0.0.1:8000
-      GROK2API_BASE_URL: ${GROK2API_BASE_URL:-http://grok2api:8000}
+      # 默认与上方 grok2api 服务名一致；改了服务名或用 host 网络时按需覆盖，如 http://127.0.0.1:8000
+      GROK2API_BASE_URL: http://grok2api:8000
     depends_on:
       grok2api:
         condition: service_healthy

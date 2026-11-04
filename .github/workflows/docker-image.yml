@@ -1,21 +1,31 @@
-name: GHCR Image
+name: Docker Image
 
+# 推送任意 v 开头的 tag（如 v3、v3.2、v3.2.0）时自动构建并发布镜像到 GHCR：
+#   ghcr.io/<owner>/<repo>:<tag>        多平台 manifest（linux/amd64 + linux/arm64）
+#   ghcr.io/<owner>/<repo>:latest       始终指向最近一次 v* tag
+#   ghcr.io/<owner>/<repo>:<tag>-amd64 / -arm64   单架构镜像（供低层排除法与合并 job 使用）
 on:
   push:
     tags:
-      - "v*.*.*"
-  workflow_dispatch:
+      - "v*"
 
 concurrency:
+  # 以 tag ref 分组：重推同一 tag 会取消上一次构建，不同 tag 互不影响。
   group: ghcr-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
   contents: read
 
+env:
+  REGISTRY: ghcr.io
+
 jobs:
-  build_ghcr_image:
-    name: Publish image (${{ matrix.arch }})
+  # ============================ 两个 job 并行构建 ============================
+  # amd64 与 arm64 分别跑在 GitHub 原生 Runner 上（arm64 使用免费的 ubuntu-24.04-arm），
+  # 互不等待；Dockerfile 已用 BUILDPLATFORM 交叉编译，无需 QEMU，速度快且稳定。
+  build:
+    name: Build (${{ matrix.arch }})
     permissions:
       contents: read
       packages: write
@@ -33,18 +43,31 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
+
+      # 镜像内嵌 VERSION 文件用于展示版本号；打 tag 前必须同步更新它，不一致直接失败，
+      # 避免构建出版本号错误的镜像。
+      - name: Verify tag matches VERSION
+        shell: bash
+        run: |
+          version=$(printf '%s' "$(cat VERSION)")
+          if [ "$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag ($GITHUB_REF_NAME) 与 VERSION 文件 ($version) 不一致，请先更新 VERSION 再打 tag"
+            exit 1
+          fi
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
+      # GHCR 镜像名必须全小写，这里把 owner/repo 归一化。
       - name: Normalize image name
         id: image
         shell: bash
         run: |
           image_name=$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
-          echo "name=ghcr.io/$image_name" >> "$GITHUB_OUTPUT"
+          echo "name=$REGISTRY/$image_name" >> "$GITHUB_OUTPUT"
 
+      # 产出：<tag>-<arch> 与 latest-<arch> 两个单架构标签。
       - name: Docker metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -52,11 +75,12 @@ jobs:
           images: ${{ steps.image.outputs.name }}
           tags: |
             type=ref,event=tag,suffix=-${{ matrix.arch }}
+            type=raw,value=latest,suffix=-${{ matrix.arch }}
 
       - name: Login to GHCR
         uses: docker/login-action@v4
         with:
-          registry: ghcr.io
+          registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
@@ -69,15 +93,19 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # 按架构隔离 GHA 构建缓存，加速后续 tag 构建。
           cache-from: type=gha,scope=${{ matrix.arch }}
           cache-to: type=gha,scope=${{ matrix.arch }},mode=max
           provenance: mode=max
           sbom: true
 
+  # ============================ 合并多平台 manifest ============================
+  # 两个架构都成功后，把单架构镜像合并成一份多平台 manifest，
+  # 并打上正式标签 <tag> 与 latest。
   merge:
-    name: Merge image
+    name: Merge manifest
     needs:
-      - build_ghcr_image
+      - build
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -92,8 +120,9 @@ jobs:
         shell: bash
         run: |
           image_name=$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
-          echo "name=ghcr.io/$image_name" >> "$GITHUB_OUTPUT"
+          echo "name=$REGISTRY/$image_name" >> "$GITHUB_OUTPUT"
 
+      # 产出：<tag> 与 latest 两个正式标签。
       - name: Docker metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -101,14 +130,16 @@ jobs:
           images: ${{ steps.image.outputs.name }}
           tags: |
             type=ref,event=tag
+            type=raw,value=latest
 
       - name: Login to GHCR
         uses: docker/login-action@v4
         with:
-          registry: ghcr.io
+          registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # 对 metadata 输出的每个标签，用单架构镜像合成多平台 manifest list。
       - name: Create manifest list
         shell: bash
         run: |

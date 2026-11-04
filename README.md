@@ -560,3 +560,7 @@ make swagger
 - [简体中文 README](./README.zh-CN.md)
 - [Backend guide](./backend/README.md)
 - [Frontend guide](./frontend/README.md)
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=MinTiang/grok2api&type=Timeline)](https://star-history.com/#MinTiang/grok2api&Timeline)
