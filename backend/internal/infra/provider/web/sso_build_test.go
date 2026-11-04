@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
+	"github.com/chenyme/grok2api/backend/internal/infra/config"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 )
 
@@ -26,6 +28,29 @@ func (c *scriptedSSOClient) Do(request *http.Request) (*http.Response, error) {
 	response := c.responses[0]
 	c.responses = c.responses[1:]
 	return response, nil
+}
+
+// dynamicSSOClient 按请求内容动态应答，用于需要回显生成态参数（如 PKCE state）的流程。
+type dynamicSSOClient struct {
+	requests []*http.Request
+	respond  func(request *http.Request) *http.Response
+}
+
+func (c *dynamicSSOClient) Do(request *http.Request) (*http.Response, error) {
+	c.requests = append(c.requests, request)
+	return c.respond(request), nil
+}
+
+func redirectResponse(status int, location string) *http.Response {
+	return &http.Response{StatusCode: status, Header: http.Header{"Location": []string{location}}, Body: io.NopCloser(strings.NewReader(""))}
+}
+
+func statusResponse(status int, body string) *http.Response {
+	return &http.Response{StatusCode: status, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(body))}
+}
+
+func htmlResponse(body string) *http.Response {
+	return statusResponse(http.StatusOK, body)
 }
 
 func TestSSOBuildFlowFollowsOnlyTrustedXAIHTTPSRedirects(t *testing.T) {
@@ -63,7 +88,7 @@ func TestSSOBuildFlowMapsDeadSSOToUnauthorized(t *testing.T) {
 		{StatusCode: http.StatusSeeOther, Header: http.Header{"Location": []string{"https://accounts.x.ai/sign-in"}}, Body: io.NopCloser(strings.NewReader(""))},
 	}}
 	flow := &ssoBuildFlow{client: client, userAgent: "lease-agent", cookies: map[string]string{"sso": "dead"}}
-	_, err := flow.convert(context.Background(), fakeCredential())
+	_, err := flow.convertDeviceFlow(context.Background(), fakeCredential())
 	if !errors.Is(err, provider.ErrUnauthorized) {
 		t.Fatalf("err = %v, want ErrUnauthorized", err)
 	}
@@ -84,7 +109,7 @@ func TestSSOBuildFlowConvertsEndToEndWithConsentToken(t *testing.T) {
 			`{"access_token":"access","refresh_token":"refresh","expires_in":3600}`))},
 	}}
 	flow := &ssoBuildFlow{client: client, userAgent: "lease-agent", cookies: ssoBuildCookies("live", "cf_clearance=clearance")}
-	seed, err := flow.convert(context.Background(), fakeCredential())
+	seed, err := flow.convertDeviceFlow(context.Background(), fakeCredential())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -270,5 +295,250 @@ func TestBrowserVerificationRequiredBody(t *testing.T) {
 	}
 	if isBrowserVerificationRequired([]byte(`{"error":"access_denied"}`)) {
 		t.Fatal("ordinary 403 misclassified as browser verification")
+	}
+}
+
+func pkceConsentHTML(state string) string {
+	return `<form method="post" action="https://auth.x.ai/oauth2/authorize">` +
+		`<input type="hidden" name="client_id" value="` + ssoBuildClientID + `"/>` +
+		`<input type="hidden" name="redirect_uri" value="` + ssoBuildRedirectURI + `"/>` +
+		`<input type="hidden" name="response_type" value="code"/>` +
+		`<input type="hidden" name="state" value="` + state + `"/>` +
+		`<input type="text" name="q" value="decoy-search-box"/>` +
+		`</form>`
+}
+
+func pkceIDToken() string {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256","typ":"JWT"}`))
+	claims := base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"user-1","email":"u@example.com"}`))
+	return header + "." + claims + ".sig"
+}
+
+func TestSSOBuildPKCEConvertsEndToEnd(t *testing.T) {
+	client := &dynamicSSOClient{}
+	client.respond = func(request *http.Request) *http.Response {
+		state := client.requests[0].URL.Query().Get("state")
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/oauth2/authorize":
+			return redirectResponse(http.StatusSeeOther, "https://accounts.x.ai/oauth2/consent?response_type=code&state="+url.QueryEscape(state))
+		case request.URL.Hostname() == "accounts.x.ai":
+			return htmlResponse(pkceConsentHTML(request.URL.Query().Get("state")))
+		case request.Method == http.MethodPost && request.URL.Path == "/oauth2/authorize":
+			return redirectResponse(http.StatusFound, "http://127.0.0.1:56121/callback?code=pkce-code&state="+url.QueryEscape(state))
+		default:
+			return htmlResponse(`{"access_token":"pkce-access","refresh_token":"pkce-refresh","id_token":"` + pkceIDToken() + `","expires_in":3600}`)
+		}
+	}
+	flow := &ssoBuildFlow{client: client, userAgent: "lease-agent", cookies: ssoBuildCookies("live", "cf_clearance=clearance")}
+	seed, err := flow.convert(context.Background(), fakeCredential())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seed.AccessToken != "pkce-access" || seed.RefreshToken != "pkce-refresh" {
+		t.Fatalf("seed = %#v", seed)
+	}
+	if seed.Provider != accountdomain.ProviderBuild || seed.AuthType != accountdomain.AuthTypeOAuth {
+		t.Fatalf("seed provider/auth = %v/%v", seed.Provider, seed.AuthType)
+	}
+	if seed.Email != "u@example.com" || seed.UserID != "user-1" {
+		t.Fatalf("seed identity = %q/%q", seed.Email, seed.UserID)
+	}
+
+	hosts := []string{"auth.x.ai", "accounts.x.ai", "auth.x.ai", "auth.x.ai"}
+	if len(client.requests) != len(hosts) {
+		t.Fatalf("requests = %d, want %d", len(client.requests), len(hosts))
+	}
+	for index, host := range hosts {
+		if client.requests[index].URL.Hostname() != host {
+			t.Fatalf("request %d visited %q, want %q (loopback must never be requested)", index, client.requests[index].URL.Hostname(), host)
+		}
+	}
+
+	authorizeQuery := client.requests[0].URL.Query()
+	if authorizeQuery.Get("response_type") != "code" || authorizeQuery.Get("client_id") != ssoBuildClientID {
+		t.Fatalf("authorize query = %#v", authorizeQuery)
+	}
+	if authorizeQuery.Get("redirect_uri") != ssoBuildRedirectURI || authorizeQuery.Get("scope") != ssoBuildPKCEScope {
+		t.Fatalf("authorize query = %#v", authorizeQuery)
+	}
+	if authorizeQuery.Get("code_challenge_method") != "S256" {
+		t.Fatalf("authorize query = %#v", authorizeQuery)
+	}
+
+	consent := client.requests[1]
+	if consent.Header.Get("Sec-Fetch-Mode") != "navigate" || consent.Header.Get("Sec-Fetch-Dest") != "document" {
+		t.Fatalf("consent GET is missing navigation headers: %#v", consent.Header)
+	}
+	cookie := consent.Header.Get("Cookie")
+	if !strings.Contains(cookie, "sso=live") || !strings.Contains(cookie, "sso-rw=live") || !strings.Contains(cookie, "cf_clearance=clearance") {
+		t.Fatalf("consent cookies = %q", cookie)
+	}
+
+	submit := client.requests[2]
+	wantHeaders := map[string]string{
+		"Origin":                    "https://accounts.x.ai",
+		"Referer":                   "https://accounts.x.ai/oauth2/consent",
+		"Sec-Fetch-Dest":            "document",
+		"Sec-Fetch-Mode":            "navigate",
+		"Sec-Fetch-Site":            "same-origin",
+		"Sec-Fetch-User":            "?1",
+		"Upgrade-Insecure-Requests": "1",
+	}
+	for name, want := range wantHeaders {
+		if got := submit.Header.Get(name); got != want {
+			t.Errorf("submit %s = %q, want %q", name, got, want)
+		}
+	}
+	submitBody, err := io.ReadAll(submit.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	submitForm, err := url.ParseQuery(string(submitBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if submitForm.Get("action") != "allow" || submitForm.Get("client_id") != ssoBuildClientID {
+		t.Fatalf("submit form = %#v", submitForm)
+	}
+	if submitForm.Get("state") != authorizeQuery.Get("state") {
+		t.Fatalf("submit form must echo consent page state: %#v", submitForm)
+	}
+	if submitForm.Has("q") {
+		t.Fatalf("non-hidden inputs must not be submitted: %#v", submitForm)
+	}
+
+	exchange := client.requests[3]
+	if exchange.Header.Get("x-grok-client-version") != config.RecommendedBuildClientVersion || exchange.Header.Get("x-grok-client-surface") != "web" {
+		t.Fatalf("token exchange headers = %#v", exchange.Header)
+	}
+	exchangeBody, err := io.ReadAll(exchange.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exchangeForm, err := url.ParseQuery(string(exchangeBody))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exchangeForm.Get("grant_type") != "authorization_code" || exchangeForm.Get("code") != "pkce-code" || exchangeForm.Get("redirect_uri") != ssoBuildRedirectURI {
+		t.Fatalf("exchange form = %#v", exchangeForm)
+	}
+	challenge := sha256.Sum256([]byte(exchangeForm.Get("code_verifier")))
+	if authorizeQuery.Get("code_challenge") != base64.RawURLEncoding.EncodeToString(challenge[:]) {
+		t.Fatalf("code_challenge does not match S256(code_verifier)")
+	}
+}
+
+func TestSSOBuildPKCEMapsSignInToUnauthorizedWithoutFallback(t *testing.T) {
+	client := &scriptedSSOClient{responses: []*http.Response{
+		redirectResponse(http.StatusSeeOther, "https://accounts.x.ai/sign-in"),
+		htmlResponse("<html>sign in</html>"),
+	}}
+	flow := &ssoBuildFlow{client: client, userAgent: "lease-agent", cookies: map[string]string{"sso": "dead"}}
+	_, err := flow.convert(context.Background(), fakeCredential())
+	if !errors.Is(err, provider.ErrUnauthorized) {
+		t.Fatalf("err = %v, want ErrUnauthorized", err)
+	}
+	if len(client.requests) != 2 {
+		t.Fatalf("requests = %d, want 2 (dead SSO must not trigger device fallback)", len(client.requests))
+	}
+}
+
+func TestSSOBuildPKCERetriesNavigationHeadersOn403(t *testing.T) {
+	posts := 0
+	client := &dynamicSSOClient{}
+	client.respond = func(request *http.Request) *http.Response {
+		state := client.requests[0].URL.Query().Get("state")
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/oauth2/authorize":
+			return redirectResponse(http.StatusSeeOther, "https://accounts.x.ai/oauth2/consent?state="+url.QueryEscape(state))
+		case request.URL.Hostname() == "accounts.x.ai":
+			return htmlResponse(pkceConsentHTML(request.URL.Query().Get("state")))
+		case request.Method == http.MethodPost && request.URL.Path == "/oauth2/authorize":
+			posts++
+			if posts == 1 {
+				return statusResponse(http.StatusForbidden, "<html>We could not verify this browser</html>")
+			}
+			return redirectResponse(http.StatusFound, "http://127.0.0.1:56121/callback?code=pkce-code&state="+url.QueryEscape(state))
+		default:
+			return htmlResponse(`{"access_token":"pkce-access","expires_in":3600}`)
+		}
+	}
+	flow := &ssoBuildFlow{client: client, userAgent: "lease-agent", cookies: map[string]string{"sso": "live"}}
+	seed, err := flow.convert(context.Background(), fakeCredential())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seed.AccessToken != "pkce-access" || posts != 2 {
+		t.Fatalf("seed = %#v posts = %d", seed, posts)
+	}
+	var tierUserAgents []string
+	var tierCacheControls []string
+	for _, request := range client.requests {
+		if request.Method == http.MethodPost && request.URL.Path == "/oauth2/authorize" {
+			tierUserAgents = append(tierUserAgents, request.Header.Get("User-Agent"))
+			tierCacheControls = append(tierCacheControls, request.Header.Get("Cache-Control"))
+		}
+	}
+	if len(tierCacheControls) != 2 || tierCacheControls[0] != "" || tierCacheControls[1] != "max-age=0" {
+		t.Fatalf("navigation header tiers = %q", tierCacheControls)
+	}
+	if tierUserAgents[0] != "lease-agent" || tierUserAgents[1] != "lease-agent" {
+		t.Fatalf("tier user agents = %q", tierUserAgents)
+	}
+}
+
+func TestSSOBuildPKCEStateMismatchFails(t *testing.T) {
+	client := &dynamicSSOClient{}
+	client.respond = func(request *http.Request) *http.Response {
+		switch {
+		case request.Method == http.MethodGet && request.URL.Path == "/oauth2/authorize":
+			return redirectResponse(http.StatusSeeOther, "https://accounts.x.ai/oauth2/consent")
+		case request.URL.Hostname() == "accounts.x.ai":
+			return htmlResponse(pkceConsentHTML(""))
+		case request.Method == http.MethodPost && request.URL.Path == "/oauth2/authorize":
+			return redirectResponse(http.StatusFound, "http://127.0.0.1:56121/callback?code=pkce-code&state=tampered")
+		default:
+			t.Fatal("token exchange must not run after state mismatch")
+			return nil
+		}
+	}
+	flow := &ssoBuildFlow{client: client, userAgent: "lease-agent", cookies: map[string]string{"sso": "live"}}
+	if _, err := flow.convertPKCE(context.Background(), fakeCredential()); err == nil || !strings.Contains(err.Error(), "state") {
+		t.Fatalf("err = %v, want state mismatch failure", err)
+	}
+}
+
+func TestSSOBuildPKCEMissingConsentFormFails(t *testing.T) {
+	client := &scriptedSSOClient{responses: []*http.Response{
+		redirectResponse(http.StatusSeeOther, "https://accounts.x.ai/oauth2/consent"),
+		htmlResponse(`<form><input type="text" name="q" value="search"/></form>`),
+	}}
+	flow := &ssoBuildFlow{client: client, userAgent: "lease-agent", cookies: map[string]string{"sso": "live"}}
+	_, err := flow.convertPKCE(context.Background(), fakeCredential())
+	if err == nil || !strings.Contains(err.Error(), "同意页表单") {
+		t.Fatalf("err = %v, want missing consent form failure", err)
+	}
+}
+
+func TestSSOBuildConvertFallsBackToDeviceFlow(t *testing.T) {
+	client := &scriptedSSOClient{responses: []*http.Response{
+		statusResponse(http.StatusInternalServerError, "pkce upstream down"),
+		{StatusCode: http.StatusOK, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(
+			`{"device_code":"dc","user_code":"uc","interval":1,"expires_in":1800}`))},
+		redirectResponse(http.StatusSeeOther, "https://accounts.x.ai/oauth2/device/consent"),
+		htmlResponse(`<form method="post"><input value="eyJhbGciOiJFUzI1NiJ9.eyJkYyI6ImRjIn0.sig" type="hidden" name="consent_token"></form>`),
+		redirectResponse(http.StatusSeeOther, "https://accounts.x.ai/oauth2/device/done"),
+		htmlResponse(`{"access_token":"device-access","refresh_token":"device-refresh","expires_in":3600}`),
+	}}
+	flow := &ssoBuildFlow{client: client, userAgent: "lease-agent", cookies: ssoBuildCookies("live", "")}
+	seed, err := flow.convert(context.Background(), fakeCredential())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if seed.AccessToken != "device-access" || seed.RefreshToken != "device-refresh" {
+		t.Fatalf("seed = %#v", seed)
+	}
+	if len(client.requests) != 6 {
+		t.Fatalf("requests = %d, want 6 (pkce failure + full device flow)", len(client.requests))
 	}
 }

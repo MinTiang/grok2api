@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -910,10 +911,10 @@ func (h *Handler) streamWebToConsoleSync(c *gin.Context, all bool, ids []uint64,
 	var total atomic.Int64
 	result, syncResult, err := h.runWebToConsoleSync(c.Request.Context(), all, ids, strategy, stream.PhaseProgressObserver("importing", &total), stream.SyncProgressObserver())
 	if err != nil {
-		stream.WriteError("accountConsoleSyncFailed", "Grok Web 账号同步到 Console 失败")
+		stream.WriteError("accountConsoleSyncFailed", "Grok Web 账号同步到 Console 失败: "+err.Error())
 		return
 	}
-	_ = stream.Write("complete", accountImportResponse{Created: result.Created, Updated: result.Updated, Skipped: result.Skipped, Synced: syncResult.Succeeded, SyncFailed: syncResult.Failed})
+	_ = stream.Write("complete", accountImportResponse{Created: result.Created, Updated: result.Updated, Skipped: result.Skipped, Failed: result.Failed, Synced: syncResult.Succeeded, SyncFailed: syncResult.Failed})
 }
 
 func (h *Handler) runWebToBuildConversion(ctx context.Context, all bool, ids []uint64, strategy accountapp.BuildConversionStrategy, progress accountapp.BatchProgressObserver, syncProgress func(completed, total int)) (accountapp.BuildConversionResult, accountsyncapp.Result, error) {
@@ -1148,7 +1149,8 @@ func (h *Handler) refreshWebQuota(c *gin.Context) {
 		return
 	}
 	if _, err := h.service.RefreshQuota(c.Request.Context(), id); err != nil {
-		h.writeServiceError(c, "quotaRefreshFailed", err, http.StatusBadGateway, "同步 Provider 额度失败")
+		slog.Default().Warn("quota_refresh_failed", "account_id", id, "error", err)
+		h.writeServiceErrorDetail(c, "quotaRefreshFailed", err, http.StatusBadGateway, "同步 Provider 额度失败", true)
 		return
 	}
 	value, err := h.service.Get(c.Request.Context(), id)
@@ -1366,6 +1368,13 @@ func newAccountDeleteResponse(result accountapp.AccountDeleteResult) gin.H {
 
 // writeServiceError 仅暴露明确的账号业务错误，未知内部错误使用稳定文案。
 func (h *Handler) writeServiceError(c *gin.Context, code string, err error, fallbackStatus int, fallbackMessage string) {
+	h.writeServiceErrorDetail(c, code, err, fallbackStatus, fallbackMessage, false)
+}
+
+// writeServiceErrorDetail 与 writeServiceError 相同；includeDetail 为 true 时，
+// 未分类错误会把底层原因附在固定文案之后返回给管理端。额度同步失败大多来自
+// 出口/上游可达性，只有固定文案无法定位具体账号与原因。
+func (h *Handler) writeServiceErrorDetail(c *gin.Context, code string, err error, fallbackStatus int, fallbackMessage string, includeDetail bool) {
 	switch {
 	case errors.Is(err, accountapp.ErrImportLimit):
 		response.Error(c, http.StatusBadRequest, "accountImportLimitExceeded", err.Error())
@@ -1386,6 +1395,12 @@ func (h *Handler) writeServiceError(c *gin.Context, code string, err error, fall
 	case errors.Is(err, accountapp.ErrWebAccountScriptBusy):
 		response.Error(c, http.StatusConflict, "webAccountScriptBusy", err.Error())
 	default:
+		if includeDetail && err != nil {
+			if detail := strings.TrimSpace(err.Error()); detail != "" {
+				response.Error(c, fallbackStatus, code, fallbackMessage+": "+detail)
+				return
+			}
+		}
 		response.Error(c, fallbackStatus, code, fallbackMessage)
 	}
 }

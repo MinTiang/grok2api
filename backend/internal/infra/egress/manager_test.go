@@ -1015,6 +1015,38 @@ func TestAcquireCredentialUsesExplicitBoundNode(t *testing.T) {
 	}
 }
 
+// Console 账号的额度/身份同步走 grok_web scope，而自动分配可能把账号绑到
+// grok_console 节点。绑定节点 scope 不兼容时布局应按请求 scope 的节点池选择，
+// 而不是让整条操作直接失败。
+func TestAcquireCredentialFallsBackToScopePoolWhenBoundNodeScopeIncompatible(t *testing.T) {
+	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	webProxy, err := cipher.Encrypt("http://web.example:8080")
+	if err != nil {
+		t.Fatal(err)
+	}
+	consoleProxy, err := cipher.Encrypt("http://console.example:8080")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := NewManager(egressRepositoryTestStub{nodes: []domain.Node{
+		{ID: 1, Name: "web", Scope: domain.ScopeWeb, Enabled: true, Health: 1, EncryptedProxyURL: webProxy},
+		{ID: 2, Name: "console", Scope: domain.ScopeConsole, Enabled: true, Health: 1, EncryptedProxyURL: consoleProxy},
+	}}, cipher)
+	lease, err := manager.AcquireCredential(context.Background(), domain.ScopeWeb, accountdomain.Credential{
+		ID: 42, Provider: accountdomain.ProviderConsole, EgressNodeID: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if lease.NodeID != 1 || lease.NodeName != "web" {
+		t.Fatalf("lease = node %d (%q), want web pool node", lease.NodeID, lease.NodeName)
+	}
+}
+
 func TestConsoleAssetCredentialPrefersDedicatedNodeWithoutCookies(t *testing.T) {
 	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
 	if err != nil {
@@ -1208,6 +1240,47 @@ func TestFlareSolverrModeIgnoresCredentialCookie(t *testing.T) {
 	defer lease.Release()
 	if solver.calls != 1 || lease.CFCookies != "cf_clearance=value-1" {
 		t.Fatalf("solver calls=%d lease cookie=%q", solver.calls, lease.CFCookies)
+	}
+}
+
+// 额度刷新 worker 只有 30s 预算，而 clearance 求解可能需要更久。求解是跨请求
+// 共享的缓存资源：调用方放弃后必须继续完成并写缓存，否则 solver 端白跑、下一次
+// 重试仍无缓存可用。
+func TestClearanceSolveContinuesAfterCallerGivesUp(t *testing.T) {
+	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	solver := &clearanceSolverStub{delay: 300 * time.Millisecond}
+	repository := &mutableEgressRepository{node: domain.Node{
+		ID: 1, Name: "web", Scope: domain.ScopeWeb, Enabled: true, Health: 1,
+	}}
+	manager := NewManager(repository, cipher)
+	manager.solver = solver
+	manager.UpdateClearanceConfig(ClearanceConfig{Mode: "flaresolverr", FlareSolverrURL: "http://solver", TargetURL: "https://grok.com", Timeout: 2 * time.Second, RefreshInterval: time.Hour})
+
+	callerCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := manager.AcquireCredential(callerCtx, domain.ScopeWeb, accountdomain.Credential{
+		ID: 42, Provider: accountdomain.ProviderWeb,
+	}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("first acquire err = %v, want DeadlineExceeded", err)
+	}
+
+	// 后台求解仍在进行：第二次获取复用同一个 in-flight 求解并命中缓存，
+	// 不应再发起新的 FlareSolverr 求解。
+	lease, err := manager.AcquireCredential(context.Background(), domain.ScopeWeb, accountdomain.Credential{
+		ID: 42, Provider: accountdomain.ProviderWeb,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Release()
+	if solver.calls != 1 {
+		t.Fatalf("solver calls = %d, want 1 (detached solve must not be restarted)", solver.calls)
+	}
+	if lease.CFCookies != "cf_clearance=value-1" {
+		t.Fatalf("lease cookie = %q", lease.CFCookies)
 	}
 }
 
@@ -2588,6 +2661,7 @@ type clearanceSolverStub struct {
 	proxyURL  string
 	err       error
 	noCookies bool
+	delay     time.Duration
 }
 
 type alwaysAcquiredDistributedLock struct{}
@@ -2596,9 +2670,16 @@ func (alwaysAcquiredDistributedLock) Acquire(context.Context, string, time.Durat
 	return func() {}, true, nil
 }
 
-func (s *clearanceSolverStub) Solve(_ context.Context, _ ClearanceConfig, proxyURL string) (clearanceSolution, error) {
+func (s *clearanceSolverStub) Solve(ctx context.Context, _ ClearanceConfig, proxyURL string) (clearanceSolution, error) {
 	s.calls++
 	s.proxyURL = proxyURL
+	if s.delay > 0 {
+		select {
+		case <-time.After(s.delay):
+		case <-ctx.Done():
+			return clearanceSolution{}, ctx.Err()
+		}
+	}
 	if s.err != nil {
 		return clearanceSolution{}, s.err
 	}

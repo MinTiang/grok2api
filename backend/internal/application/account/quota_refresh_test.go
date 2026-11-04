@@ -156,10 +156,13 @@ func TestQuotaRefreshFailureUsesBoundedExponentialBackoff(t *testing.T) {
 	now := time.Date(2026, 8, 5, 8, 0, 0, 0, time.UTC)
 	service.now = func() time.Time { return now }
 	service.quotaRefreshes["1:console"] = &quotaRefreshState{running: true}
-	for failure := 1; failure <= 10; failure++ {
+	for failure := 1; failure <= 20; failure++ {
 		service.deferQuotaRefresh("1:console")
 		state := service.quotaRefreshes["1:console"]
-		maximum := quotaRefreshBackoffBase * time.Duration(1<<min(failure-1, 6))
+		maximum := quotaRefreshBackoffBase
+		for attempt := 1; attempt < failure && maximum < quotaRefreshBackoffMax; attempt++ {
+			maximum *= 2
+		}
 		if maximum > quotaRefreshBackoffMax {
 			maximum = quotaRefreshBackoffMax
 		}
@@ -167,6 +170,9 @@ func TestQuotaRefreshFailureUsesBoundedExponentialBackoff(t *testing.T) {
 		if state.failures != failure || !state.pending || delay < maximum/2 || delay > maximum {
 			t.Fatalf("failure=%d state=%#v delay=%s range=[%s,%s]", failure, state, delay, maximum/2, maximum)
 		}
+	}
+	if quotaRefreshBackoffMax < 10*time.Minute {
+		t.Fatalf("quota refresh backoff ceiling = %s, persistent upstream outages must not retry every minute", quotaRefreshBackoffMax)
 	}
 }
 

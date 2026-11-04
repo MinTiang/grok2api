@@ -1,7 +1,10 @@
 package web
 
 import (
+	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -17,6 +20,7 @@ import (
 
 	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
 	egressdomain "github.com/chenyme/grok2api/backend/internal/domain/egress"
+	"github.com/chenyme/grok2api/backend/internal/infra/config"
 	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
@@ -26,12 +30,25 @@ import (
 const (
 	ssoBuildClientID = "b1a00492-073a-47ea-816f-4c329264a828"
 	ssoBuildScope    = "openid profile email offline_access grok-cli:access api:access conversations:read conversations:write"
-	ssoDeviceURL     = "https://auth.x.ai/oauth2/device/code"
-	ssoVerifyURL     = "https://auth.x.ai/oauth2/device/verify"
-	ssoApproveURL    = "https://auth.x.ai/oauth2/device/approve"
-	ssoTokenURL      = "https://auth.x.ai/oauth2/token"
-	maxAuthBody      = 2 << 20
+	// ssoBuildPKCEScope 是 PKCE 授权流程使用的最小 scope（实测可用集）：Build/CLI
+	// 上游只需要 grok-cli:access + api:access；conversations:* 由 Web SSO cookie
+	// 承担，不随 Build 凭据申请。
+	ssoBuildPKCEScope = "openid profile email offline_access grok-cli:access api:access"
+	ssoDeviceURL      = "https://auth.x.ai/oauth2/device/code"
+	ssoVerifyURL      = "https://auth.x.ai/oauth2/device/verify"
+	ssoApproveURL     = "https://auth.x.ai/oauth2/device/approve"
+	ssoAuthorizeURL   = "https://auth.x.ai/oauth2/authorize"
+	ssoTokenURL       = "https://auth.x.ai/oauth2/token"
+	// ssoBuildRedirectURI 是 Grok CLI 注册的 loopback 回调地址。授权码只从 302 的
+	// Location 中解析，该地址本身不会被请求。
+	ssoBuildRedirectURI = "http://127.0.0.1:56121/callback"
+	maxAuthBody         = 2 << 20
 )
+
+// ssoBuildDeviceFallback 控制 PKCE 主路径失败后是否再尝试 device flow。默认开启：
+// 若上游恢复 device flow 或转而拦截 PKCE，兜底仍可完成转换；置为 false 可省去一次
+// 注定失败的请求。
+var ssoBuildDeviceFallback = true
 
 type ssoBuildHTTPClient interface {
 	Do(*http.Request) (*http.Response, error)
@@ -75,7 +92,334 @@ func (a *Adapter) ConvertToBuild(ctx context.Context, credential accountdomain.C
 	return seed, nil
 }
 
+// convert 先走 PKCE 主路径，失败且非明确的授权拒绝时再用 device flow 兜底。
+// 2026-10 起 device flow 的 approve 被 Cloudflare 永久拦截：该端点要求只有 consent
+// 页面脚本才能产出的浏览器令牌，补充任何请求头都返回 403「We could not verify this
+// browser」。PKCE 提交的是 consent 页面上真实存在的跨站表单，具备完整浏览器导航
+// 语义即可通过，因此成为主路径。
 func (f *ssoBuildFlow) convert(ctx context.Context, credential accountdomain.Credential) (provider.CredentialSeed, error) {
+	seed, err := f.convertPKCE(ctx, credential)
+	if err == nil {
+		return seed, nil
+	}
+	if !ssoBuildDeviceFallback || errors.Is(err, provider.ErrUnauthorized) || errors.Is(err, provider.ErrAuthorizationDenied) {
+		return provider.CredentialSeed{}, err
+	}
+	if fallbackSeed, fallbackErr := f.convertDeviceFlow(ctx, credential); fallbackErr == nil {
+		return fallbackSeed, nil
+	}
+	return provider.CredentialSeed{}, err
+}
+
+// convertPKCE 通过 authorization code + PKCE 流程换取 Build token（当前唯一可用的
+// 协议路径）。流程：GET /oauth2/authorize（已带 sso/sso-rw cookie，303 跳同意页）
+// → 解析同意页隐藏表单 → POST /oauth2/authorize 提交同意（需完整浏览器导航头）
+// → 302 到 loopback 带 code → POST /oauth2/token 用 code_verifier 换 token。
+//
+// 与 device flow 的关键差异：整个流程没有任何被 CF 标记的可疑状态变更端点，POST
+// 的是页面上真实存在的跨站表单，因此能通过 Cloudflare 校验。
+func (f *ssoBuildFlow) convertPKCE(ctx context.Context, credential accountdomain.Credential) (provider.CredentialSeed, error) {
+	verifier, err := randomB64URL(64)
+	if err != nil {
+		return provider.CredentialSeed{}, err
+	}
+	challenge := sha256.Sum256([]byte(verifier))
+	state, err := randomB64URL(16)
+	if err != nil {
+		return provider.CredentialSeed{}, err
+	}
+	authorizeQuery := url.Values{
+		"response_type":         {"code"},
+		"client_id":             {ssoBuildClientID},
+		"redirect_uri":          {ssoBuildRedirectURI},
+		"scope":                 {ssoBuildPKCEScope},
+		"code_challenge":        {base64.RawURLEncoding.EncodeToString(challenge[:])},
+		"code_challenge_method": {"S256"},
+		"state":                 {state},
+	}
+	// GET 本身不触发 CF 校验，正常 303 → accounts.x.ai 的同意页
+	status, finalURL, body, err := f.do(ctx, http.MethodGet, ssoAuthorizeURL+"?"+authorizeQuery.Encode(), nil)
+	if err != nil {
+		return provider.CredentialSeed{}, err
+	}
+	if ssoDeviceRedirectState(finalURL) == "sign-in" {
+		return provider.CredentialSeed{}, provider.ErrUnauthorized
+	}
+	if status < 200 || status >= 300 {
+		return provider.CredentialSeed{}, fmt.Errorf("SSO PKCE 获取同意页失败: %w", conversionHTTPError{status: status})
+	}
+	form := parseConsentFormFields(body)
+	if form == nil {
+		// 常见于 SSO 失效被踢回登录页（无重定向直接 200）或返回挑战页
+		return provider.CredentialSeed{}, fmt.Errorf("SSO PKCE 转换失败：未获取到同意页表单（SSO 可能已失效）")
+	}
+	form.Set("action", "allow")
+
+	code, err := f.submitConsent(ctx, finalURL, form, state)
+	if err != nil {
+		return provider.CredentialSeed{}, err
+	}
+	token, err := f.exchangePKCECode(ctx, code, verifier)
+	if err != nil {
+		return provider.CredentialSeed{}, err
+	}
+	return buildCredentialSeed(token, credential), nil
+}
+
+// submitConsent 以浏览器跨站表单语义提交同意页。请求头逐档增强：403 表示 CF 判为
+// 非浏览器导航，换更完整的档位重试而不是「参数错误」；成功时 302 的 Location 指向
+// loopback 回调，仅从中解析授权码，绝不发起请求。
+func (f *ssoBuildFlow) submitConsent(ctx context.Context, consentPageURL string, form url.Values, state string) (string, error) {
+	referer := consentReferer(consentPageURL)
+	lastStatus := 0
+	for _, headers := range navigationHeaderTiers(f.userAgent) {
+		status, location, _, err := f.postAuthorizeNoFollow(ctx, form, headers, referer)
+		if err != nil {
+			return "", err
+		}
+		lastStatus = status
+		if status == http.StatusForbidden {
+			continue
+		}
+		code, returnedState, ok := extractAuthorizationCode(location)
+		if !ok {
+			// 3xx 但没有 code（带 error=）或其它状态码：换档位重试也不会有改善
+			return "", fmt.Errorf("SSO PKCE 提交同意失败: %w", conversionHTTPError{status: status})
+		}
+		if returnedState != state {
+			return "", fmt.Errorf("SSO PKCE 提交同意失败：state 校验不一致")
+		}
+		return code, nil
+	}
+	return "", fmt.Errorf("SSO PKCE 提交同意失败：浏览器导航头全部被拒绝: %w", conversionHTTPError{status: lastStatus})
+}
+
+// postAuthorizeNoFollow 提交同意表单但不跟随重定向：成功时 302 的 Location 指向
+// loopback 回调（只解析不请求），因此不经过通用重定向处理。
+func (f *ssoBuildFlow) postAuthorizeNoFollow(ctx context.Context, form url.Values, headers map[string]string, referer string) (int, string, []byte, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodPost, ssoAuthorizeURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return 0, "", nil, err
+	}
+	request.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+	request.Header.Set("Cookie", f.cookieHeader())
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	for key, value := range headers {
+		request.Header.Set(key, value)
+	}
+	request.Header.Set("Referer", referer)
+	response, err := f.client.Do(request)
+	if err != nil {
+		return 0, "", nil, err
+	}
+	f.captureCookies(response)
+	data, readErr := io.ReadAll(io.LimitReader(response.Body, maxAuthBody+1))
+	_ = response.Body.Close()
+	if readErr != nil {
+		return response.StatusCode, "", nil, readErr
+	}
+	if len(data) > maxAuthBody {
+		return response.StatusCode, "", nil, fmt.Errorf("xAI OAuth 响应超过 2 MiB")
+	}
+	return response.StatusCode, strings.TrimSpace(response.Header.Get("Location")), data, nil
+}
+
+// exchangePKCECode 用授权码 + code_verifier 换取 token。
+func (f *ssoBuildFlow) exchangePKCECode(ctx context.Context, code, verifier string) (ssoBuildToken, error) {
+	status, _, body, err := f.doWithFollowHeaders(ctx, http.MethodPost, ssoTokenURL, url.Values{
+		"grant_type":    {"authorization_code"},
+		"client_id":     {ssoBuildClientID},
+		"code":          {code},
+		"redirect_uri":  {ssoBuildRedirectURI},
+		"code_verifier": {verifier},
+	}, true, map[string]string{
+		"x-grok-client-version": config.RecommendedBuildClientVersion,
+		"x-grok-client-surface": "web",
+	})
+	if err != nil {
+		return ssoBuildToken{}, err
+	}
+	var payload struct {
+		AccessToken      string `json:"access_token"`
+		RefreshToken     string `json:"refresh_token"`
+		IDToken          string `json:"id_token"`
+		ExpiresIn        int    `json:"expires_in"`
+		Error            string `json:"error"`
+		ErrorDescription string `json:"error_description"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return ssoBuildToken{}, fmt.Errorf("解析 xAI OAuth Token: %w", err)
+	}
+	if payload.AccessToken == "" {
+		return ssoBuildToken{}, fmt.Errorf("xAI OAuth Token 失败 (%s): %w", firstValue(payload.ErrorDescription, payload.Error, strconv.Itoa(status)), conversionHTTPError{status: status})
+	}
+	if payload.ExpiresIn <= 0 {
+		payload.ExpiresIn = 3600
+	}
+	return ssoBuildToken{AccessToken: payload.AccessToken, RefreshToken: payload.RefreshToken, IDToken: payload.IDToken, ExpiresAt: time.Now().UTC().Add(time.Duration(payload.ExpiresIn) * time.Second)}, nil
+}
+
+// navigationHeaderTiers 构建逐档增强的浏览器导航请求头。实测差异很明确：仅
+// Content-Type 必然 403 挑战页；补齐 Origin/Referer/UA/Accept/Sec-Fetch-* 的完整
+// 导航语义即可通过。UA 使用 Lease 的真实 UA 以匹配出口的 TLS 指纹 profile；client
+// hints 的 Chrome 大版本从 UA 推导，推导不出时省略。Accept-Encoding 交由出口
+// 客户端自行协商，不在此设置。
+func navigationHeaderTiers(userAgent string) []map[string]string {
+	base := map[string]string{
+		"User-Agent":                userAgent,
+		"Accept-Language":           "en-US,en;q=0.9",
+		"Origin":                    "https://accounts.x.ai",
+		"Sec-Fetch-Dest":            "document",
+		"Sec-Fetch-Mode":            "navigate",
+		"Sec-Fetch-Site":            "same-origin",
+		"Sec-Fetch-User":            "?1",
+		"Upgrade-Insecure-Requests": "1",
+	}
+	tier2 := cloneHeaders(base)
+	tier2["Cache-Control"] = "max-age=0"
+	for key, value := range chromeClientHints(userAgent) {
+		tier2[key] = value
+	}
+	tier3 := cloneHeaders(tier2)
+	tier3["DNT"] = "1"
+	tier3["Priority"] = "u=0, i"
+	return []map[string]string{base, tier2, tier3}
+}
+
+func cloneHeaders(headers map[string]string) map[string]string {
+	clone := make(map[string]string, len(headers))
+	for key, value := range headers {
+		clone[key] = value
+	}
+	return clone
+}
+
+// chromeClientHints 从 UA 推导 sec-ch-ua 客户端提示；UA 不含 Chrome 版本时返回 nil。
+func chromeClientHints(userAgent string) map[string]string {
+	match := chromeMajorPattern.FindStringSubmatch(strings.TrimSpace(userAgent))
+	if len(match) != 2 {
+		return nil
+	}
+	major := match[1]
+	hints := map[string]string{
+		"sec-ch-ua":          fmt.Sprintf(`"Not=A?Brand";v="99", "Google Chrome";v="%s", "Chromium";v="%s"`, major, major),
+		"sec-ch-ua-mobile":   "?0",
+		"sec-ch-ua-platform": `"Windows"`,
+	}
+	switch {
+	case strings.Contains(userAgent, "Windows"):
+		hints["sec-ch-ua-platform"] = `"Windows"`
+	case strings.Contains(userAgent, "Macintosh"), strings.Contains(userAgent, "Mac OS"):
+		hints["sec-ch-ua-platform"] = `"macOS"`
+	case strings.Contains(userAgent, "Android"):
+		hints["sec-ch-ua-platform"] = `"Android"`
+		hints["sec-ch-ua-mobile"] = "?1"
+	case strings.Contains(userAgent, "iPhone"), strings.Contains(userAgent, "iPad"):
+		hints["sec-ch-ua-platform"] = `"iOS"`
+		hints["sec-ch-ua-mobile"] = "?1"
+	case strings.Contains(userAgent, "Linux"), strings.Contains(userAgent, "X11"):
+		hints["sec-ch-ua-platform"] = `"Linux"`
+	}
+	return hints
+}
+
+var chromeMajorPattern = regexp.MustCompile(`(?i)Chrome/(\d+)`)
+
+// parseConsentFormFields 从同意页解析待提交的表单隐藏字段。只收 hidden input：
+// 页面里还有搜索框等无关 input，混进来会被上游拒绝。缺 client_id/redirect_uri
+// 说明拿到的不是同意页（可能是挑战页或登录页）。
+func parseConsentFormFields(body []byte) url.Values {
+	form := url.Values{}
+	tokenizer := html.NewTokenizer(bytes.NewReader(body))
+	for {
+		tokenType := tokenizer.Next()
+		if tokenType == html.ErrorToken {
+			break
+		}
+		if tokenType != html.StartTagToken && tokenType != html.SelfClosingTagToken {
+			continue
+		}
+		token := tokenizer.Token()
+		if !strings.EqualFold(token.Data, "input") {
+			continue
+		}
+		var name, value, inputType string
+		for _, attribute := range token.Attr {
+			switch strings.ToLower(attribute.Key) {
+			case "name":
+				name = attribute.Val
+			case "value":
+				value = attribute.Val
+			case "type":
+				inputType = attribute.Val
+			}
+		}
+		if name == "" || !strings.EqualFold(inputType, "hidden") {
+			continue
+		}
+		form.Set(name, value)
+	}
+	if form.Get("client_id") == "" || form.Get("redirect_uri") == "" {
+		return nil
+	}
+	return form
+}
+
+// extractAuthorizationCode 从回调 Location 中解析授权码与回传的 state。
+func extractAuthorizationCode(location string) (string, string, bool) {
+	parsed, err := url.Parse(strings.TrimSpace(location))
+	if err != nil {
+		return "", "", false
+	}
+	query := parsed.Query()
+	code := strings.TrimSpace(query.Get("code"))
+	if code == "" {
+		return "", "", false
+	}
+	return code, query.Get("state"), true
+}
+
+// consentReferer 返回不带 query 的同意页地址：Origin 是固定值，Referer 若带上
+// ?response_type=... 会与其语义冲突，更像伪造。
+func consentReferer(pageURL string) string {
+	parsed, err := url.Parse(pageURL)
+	if err != nil || parsed.Host == "" {
+		return "https://accounts.x.ai/oauth2/consent"
+	}
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return parsed.String()
+}
+
+func randomB64URL(byteLen int) (string, error) {
+	buf := make([]byte, byteLen)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("生成 PKCE 随机数失败: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(buf), nil
+}
+
+// buildCredentialSeed 由 token 响应构造 Build 凭据种子，两条转换路径共用。
+func buildCredentialSeed(token ssoBuildToken, credential accountdomain.Credential) provider.CredentialSeed {
+	claims := decodeBuildClaims(firstValue(token.IDToken, token.AccessToken))
+	userID := claimString(claims, "sub")
+	email := claimString(claims, "email")
+	teamID := claimString(claims, "team_id")
+	name := strings.TrimSpace(credential.Name)
+	if name == "" {
+		name = "Grok Web account"
+	}
+	return provider.CredentialSeed{
+		Provider: accountdomain.ProviderBuild, AuthType: accountdomain.AuthTypeOAuth,
+		Name: firstValue(email, name+" Build", userID, "Grok Build account"), Email: email, UserID: userID, TeamID: teamID,
+		SourceKey: "sso-build:" + security.HashToken(token.AccessToken), OIDCClientID: ssoBuildClientID,
+		AccessToken: token.AccessToken, RefreshToken: token.RefreshToken, ExpiresAt: token.ExpiresAt,
+	}
+}
+
+// convertDeviceFlow 是 device flow 兜底路径：device/code → verify → approve（需
+// consent_token 防伪令牌）→ 轮询 token。
+func (f *ssoBuildFlow) convertDeviceFlow(ctx context.Context, credential accountdomain.Credential) (provider.CredentialSeed, error) {
 	form := url.Values{"client_id": {ssoBuildClientID}, "scope": {ssoBuildScope}}
 	status, _, body, err := f.do(ctx, http.MethodPost, ssoDeviceURL, form)
 	if err != nil {
@@ -178,20 +522,7 @@ func (f *ssoBuildFlow) convert(ctx context.Context, credential accountdomain.Cre
 	if err != nil {
 		return provider.CredentialSeed{}, err
 	}
-	claims := decodeBuildClaims(firstValue(token.IDToken, token.AccessToken))
-	userID := claimString(claims, "sub")
-	email := claimString(claims, "email")
-	teamID := claimString(claims, "team_id")
-	name := strings.TrimSpace(credential.Name)
-	if name == "" {
-		name = "Grok Web account"
-	}
-	return provider.CredentialSeed{
-		Provider: accountdomain.ProviderBuild, AuthType: accountdomain.AuthTypeOAuth,
-		Name: firstValue(email, name+" Build", userID, "Grok Build account"), Email: email, UserID: userID, TeamID: teamID,
-		SourceKey: "sso-build:" + security.HashToken(token.AccessToken), OIDCClientID: ssoBuildClientID,
-		AccessToken: token.AccessToken, RefreshToken: token.RefreshToken, ExpiresAt: token.ExpiresAt,
-	}, nil
+	return buildCredentialSeed(token, credential), nil
 }
 
 type ssoBuildToken struct {
@@ -361,7 +692,8 @@ func ssoDeviceRedirectState(raw string) string {
 	}
 	path := strings.TrimRight(parsed.EscapedPath(), "/")
 	switch path {
-	case "/oauth2/device/consent":
+	// /oauth2/consent 是 PKCE 授权流程的同意页；device flow 的同意页带 device 前缀
+	case "/oauth2/device/consent", "/oauth2/consent":
 		return "consent"
 	case "/oauth2/device/done":
 		return "done"

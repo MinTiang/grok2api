@@ -78,7 +78,11 @@ const (
 	quotaRefreshPollInterval                      = 500 * time.Millisecond
 	quotaRefreshSharedPoll                        = time.Second
 	quotaRefreshBackoffBase                       = time.Second
-	quotaRefreshBackoffMax                        = time.Minute
+	// quotaRefreshBackoffMax 上限过短会形成重试风暴：上游持续故障（如
+	// FlareSolverr 饱和）时，每个失败账号会以分钟级节奏反复重试，并各自占用
+	// 一个共享求解/出口资源，把临时故障放大成全面不可用。指数退避允许到
+	// 15 分钟，成功一次即清零，不影响瞬时抖动后的快速恢复。
+	quotaRefreshBackoffMax = 15 * time.Minute
 	// usage-status lags execution by ~45s; sampling faster only re-reads stale values.
 	consoleQuotaRefreshMinInterval                = 60 * time.Second
 	unknownRemoteQuotaProbeDelay    time.Duration = 5 * time.Minute
@@ -1704,6 +1708,7 @@ func (s *Service) SyncAllWebAccountsToConsoleWithStrategy(ctx context.Context, s
 		current, err := s.syncWebCredentialsToConsole(ctx, values, observer, offsetBatchProgress(progress, completed, total))
 		result.Created += current.Created
 		result.Updated += current.Updated
+		result.Failed += current.Failed
 		result.AccountIDs = append(result.AccountIDs, current.AccountIDs...)
 		if err != nil {
 			return result, err
@@ -1721,7 +1726,12 @@ func (s *Service) syncWebCredentialsToConsole(ctx context.Context, values []acco
 	if !ok {
 		return ImportResult{}, fmt.Errorf("Grok Console Provider 未注册")
 	}
+	// Console 授权资格体检（RSC 账号快照）：仅 cursorMerged=true 且未被限制的
+	// Web SSO 允许同步。未注册该能力的注册表（如测试桩）跳过体检。
+	eligibility, canCheckEligibility := s.providers.ConsoleEligibility(accountdomain.ProviderWeb)
 	seeds := make([]provider.CredentialSeed, 0, len(values))
+	rejected := 0
+	var firstRejection error
 	for _, value := range values {
 		if value.Provider != accountdomain.ProviderWeb || value.AuthType != accountdomain.AuthTypeSSO {
 			return ImportResult{}, fmt.Errorf("%w: 仅 Grok Web SSO 账号支持同步到 Console", ErrUnsupported)
@@ -1733,6 +1743,15 @@ func (s *Service) syncWebCredentialsToConsole(ctx context.Context, values []acco
 		// 非法 UTF-8 会被 json.Marshal 静默改写为 U+FFFD，显式拒绝优于静默改动（不应回显 token 内容）。
 		if !utf8.ValidString(token) {
 			return ImportResult{}, fmt.Errorf("解密 Grok Web SSO: 凭据不是合法 UTF-8")
+		}
+		if canCheckEligibility {
+			if err := eligibility.CheckConsoleEligibility(ctx, value); err != nil {
+				rejected++
+				if firstRejection == nil {
+					firstRejection = err
+				}
+				continue
+			}
 		}
 		// 内部调用固定走 JSON 对象路径，避免 plain token 被格式嗅探（如「[」JSON 保留前缀）误判。
 		payload, err := json.Marshal(map[string]string{"sso_token": token})
@@ -1759,7 +1778,15 @@ func (s *Service) syncWebCredentialsToConsole(ctx context.Context, values []acco
 		}
 		seeds = append(seeds, seed)
 	}
-	return s.persistImportedSeeds(ctx, seeds, observer, progress)
+	result, err := s.persistImportedSeeds(ctx, seeds, observer, progress)
+	if err != nil {
+		return ImportResult{}, err
+	}
+	result.Failed = rejected
+	if rejected > 0 && len(seeds) == 0 {
+		return result, fmt.Errorf("Grok Web 账号全部未通过 Console 资格体检: %w", firstRejection)
+	}
+	return result, nil
 }
 
 func webConsoleAccountName(webName, fallback string) string {
@@ -3731,8 +3758,10 @@ func quotaRefreshRetryDelay(failures int) time.Duration {
 	if failures < 1 {
 		failures = 1
 	}
-	shift := min(failures-1, 6)
-	delay := quotaRefreshBackoffBase * time.Duration(1<<shift)
+	delay := quotaRefreshBackoffBase
+	for attempt := 1; attempt < failures && delay < quotaRefreshBackoffMax; attempt++ {
+		delay *= 2
+	}
 	if delay > quotaRefreshBackoffMax {
 		delay = quotaRefreshBackoffMax
 	}

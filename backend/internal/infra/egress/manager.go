@@ -44,6 +44,12 @@ const clearanceCacheMinIdleTTL = 30 * time.Minute
 const maxCachedClearances = 16384
 const clearanceCacheEvictionBatch = 256
 
+// maxConcurrentClearanceSolves 限制同时进行的 FlareSolverr 求解数。每个求解会
+// 拉起一个浏览器会话（数百 MB 内存），账号池较大时如果没有入口限流，批量额度
+// 刷新会一次性打入数十个请求，把 solver 的连接/线程队列打爆（表现为
+// "failed to start a thread for the new session"），进而所有求解一起超时。
+const maxConcurrentClearanceSolves = 4
+
 // clientClosedRequestStatus is the conventional proxy status for a client-aborted request.
 const clientClosedRequestStatus = 499
 const egressIPv4ProbeEndpoint = "https://ipinfo.io/json"
@@ -169,6 +175,7 @@ type Manager struct {
 	clearances             map[string]clearanceState
 	lastClearanceCleanup   time.Time
 	solver                 clearanceSolver
+	solverSlots            chan struct{}
 	clearanceLock          repository.DistributedLock
 	newBuildClient         func(string, time.Duration) (requestClient, error)
 	newBuildEnvClient      func(time.Duration) (requestClient, error)
@@ -232,6 +239,7 @@ func NewManager(repository repository.EgressRepository, cipher *security.Cipher)
 		failureProbes:  make(map[uint64]failureProbeState),
 		newBuildClient: newBuildRequestClient, newBuildEnvClient: newBuildEnvironmentRequestClient, newBrowserClient: newBrowserClient,
 		solver:          flaresolverrSolver{},
+		solverSlots:     make(chan struct{}, maxConcurrentClearanceSolves),
 		clearanceConfig: ClearanceConfig{Mode: "manual", TargetURL: "https://grok.com", Timeout: time.Minute, RefreshInterval: 10 * time.Minute},
 	}
 	manager.buildHeaderTimeout.Store(int64(settingsdomain.DefaultBuildResponseHeaderTimeout))
@@ -819,6 +827,7 @@ func (m *Manager) acquire(ctx context.Context, scope domain.Scope, affinity stri
 	if boundNodeID != 0 {
 		waitedForProbe := false
 		qualityProbe := qualityProbeFromContext(ctx)
+	boundLoop:
 		for {
 			now = time.Now().UTC()
 			selected, err := m.repository.GetEgressNode(ctx, boundNodeID)
@@ -830,7 +839,13 @@ func (m *Manager) acquire(ctx context.Context, scope domain.Scope, affinity stri
 				return m.acquireUnavailableFallback(ctx, scope, affinity, allowDirect, encryptedCredentialCookies, managedClearance, primaryErr)
 			}
 			if !domain.SupportsScope(selected.Scope, scope) {
-				return m.acquireUnavailableFallback(ctx, scope, affinity, allowDirect, encryptedCredentialCookies, managedClearance, fmt.Errorf("绑定出口节点 %d 与 %s 作用域不兼容", boundNodeID, scope))
+				// 绑定节点只对自身支持的 scope 生效：Console 账号查询 grok.com
+				// 额度/身份走 grok_web scope，而自动分配可能把账号绑在
+				// grok_console 节点上。此时按请求 scope 的正常节点池选择，
+				// 不能因为绑定关系让整条操作直接失败（绑定本身保持不变）。
+				m.log().DebugContext(ctx, "egress_bound_node_scope_mismatch",
+					"node_id", boundNodeID, "node_scope", selected.Scope, "request_scope", scope)
+				break boundLoop
 			}
 			if !selected.Enabled && !qualityProbe {
 				return m.acquireUnavailableFallback(ctx, scope, affinity, allowDirect, encryptedCredentialCookies, managedClearance, fmt.Errorf("绑定出口节点 %d 已禁用", boundNodeID))
@@ -1831,17 +1846,36 @@ func (m *Manager) ensureClearance(ctx context.Context, node domain.Node, proxyUR
 	}
 	m.clearanceMu.Unlock()
 
-	result, err, _ := m.clearanceLoads.Do(key, func() (any, error) {
-		return m.refreshNode(ctx, node, proxyURL, key, persist, forceRefresh, !fallbackAllowed, refreshAfter)
-	})
-	if err != nil {
-		if fallbackAllowed {
-			return fallback.Cookies, fallback.UserAgent, nil
-		}
-		return "", "", err
+	// Clearance 是跨请求共享的缓存资源：一次求解成功会被大量后续请求复用。
+	// 求解预算不能继承调用方 ctx（批量额度刷新 worker 只有 30s），否则调用方
+	// 一到期限就丢弃仍在运行的 FlareSolverr 会话：solver 端继续跑到自己的
+	// maxTimeout，白占求解队列，而下一次重试依旧没有缓存可用。这里用独立预算
+	// 完成求解并写入缓存，调用方只在自己期限内等待结果。
+	solveBudget := cfg.Timeout
+	if solveBudget <= 0 {
+		solveBudget = time.Minute
 	}
-	solution := result.(clearanceSolution)
-	return solution.Cookies, solution.UserAgent, nil
+	loadCtx, loadCancel := context.WithTimeout(context.WithoutCancel(ctx), solveBudget+clearanceLockGrace)
+	loaded := m.clearanceLoads.DoChan(key, func() (any, error) {
+		defer loadCancel()
+		return m.refreshNode(loadCtx, node, proxyURL, key, persist, forceRefresh, !fallbackAllowed, refreshAfter)
+	})
+	select {
+	case <-ctx.Done():
+		return "", "", ctx.Err()
+	case result := <-loaded:
+		if result.Err != nil {
+			if fallbackAllowed {
+				return fallback.Cookies, fallback.UserAgent, nil
+			}
+			return "", "", result.Err
+		}
+		solution, ok := result.Val.(clearanceSolution)
+		if !ok {
+			return "", "", errors.New("Clearance 求解返回类型无效")
+		}
+		return solution.Cookies, solution.UserAgent, nil
+	}
 }
 
 func (m *Manager) refreshNode(ctx context.Context, node domain.Node, proxyURL, key string, persist, force, waitForPeer bool, refreshAfter time.Time) (clearanceSolution, error) {
@@ -1893,11 +1927,17 @@ func (m *Manager) refreshNode(ctx context.Context, node domain.Node, proxyURL, k
 			}
 		}
 	}
-	solveCtx, cancel := context.WithTimeout(ctx, timeout)
+	solveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
 	defer cancel()
+	// 求解入口限流：每个 FlareSolverr 请求都会拉起一个浏览器会话，批量额度
+	// 刷新若不加限制会一次打入数十个并发，直接打爆 solver 的线程/连接队列。
+	if err := m.acquireSolverSlot(solveCtx); err != nil {
+		return clearanceSolution{}, err
+	}
+	defer m.releaseSolverSlot()
 	solution, err := solver.Solve(solveCtx, cfg, proxyURL)
 	if err != nil {
-		m.recordClearanceError(ctx, node, persist)
+		m.recordClearanceError(solveCtx, node, persist)
 		return clearanceSolution{}, fmt.Errorf("刷新出口 %q 的 Cloudflare Clearance: %w", node.Name, err)
 	}
 	now := time.Now().UTC()
@@ -1929,6 +1969,28 @@ func (m *Manager) refreshNode(ctx context.Context, node domain.Node, proxyURL, k
 	}
 	m.cacheClearance(key, solution, now, solveVersion, fingerprint, bindingFingerprint, interval)
 	return solution, nil
+}
+
+func (m *Manager) acquireSolverSlot(ctx context.Context) error {
+	if m.solverSlots == nil {
+		return nil
+	}
+	select {
+	case m.solverSlots <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (m *Manager) releaseSolverSlot() {
+	if m.solverSlots == nil {
+		return
+	}
+	select {
+	case <-m.solverSlots:
+	default:
+	}
 }
 
 func (m *Manager) waitPersistedClearance(ctx context.Context, nodeID uint64, fingerprint, bindingFingerprint string, interval, timeout time.Duration, refreshAfter time.Time) (clearanceSolution, time.Time, bool) {

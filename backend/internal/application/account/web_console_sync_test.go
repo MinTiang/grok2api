@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -414,4 +415,127 @@ func (a consoleSSOCodecAdapter) ParseImportedCredentials(data []byte) ([]provide
 
 func (consoleSSOCodecAdapter) MarshalCredentials([]provider.CredentialSeed) ([]byte, error) {
 	return nil, nil
+}
+
+// consoleEligibilityAdapter 模拟 Web Provider 的 RSC 资格体检：按账号名决定放行或拒绝。
+type consoleEligibilityAdapter struct {
+	reject func(accountdomain.Credential) error
+}
+
+func (consoleEligibilityAdapter) Provider() accountdomain.Provider { return accountdomain.ProviderWeb }
+
+func (a consoleEligibilityAdapter) CheckConsoleEligibility(_ context.Context, credential accountdomain.Credential) error {
+	if a.reject != nil {
+		return a.reject(credential)
+	}
+	return nil
+}
+
+func newEligibilityTestService(t *testing.T, databasePath string, eligibility consoleEligibilityAdapter) (*Service, *relational.AccountRepository, func(string) string) {
+	t.Helper()
+	ctx := context.Background()
+	database, err := relational.OpenSQLite(ctx, filepath.Join(t.TempDir(), databasePath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	if err := database.InitializeSchema(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cipher, err := security.NewCipher(base64.StdEncoding.EncodeToString(make([]byte, 32)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encrypt := func(value string) string {
+		encrypted, encryptErr := cipher.Encrypt(value)
+		if encryptErr != nil {
+			t.Fatal(encryptErr)
+		}
+		return encrypted
+	}
+	accounts := relational.NewAccountRepository(database)
+	service := NewService(accounts, nil, nil, nil, provider.NewRegistry(consoleSSOCodecAdapter{}, eligibility), cipher, memory.NewLockStore())
+	return service, accounts, encrypt
+}
+
+func TestSyncWebAccountsToConsoleSkipsAccountsFailingEligibility(t *testing.T) {
+	ctx := context.Background()
+	var checked []string
+	service, accounts, encrypt := newEligibilityTestService(t, "web-console-gate.db", consoleEligibilityAdapter{
+		reject: func(credential accountdomain.Credential) error {
+			checked = append(checked, credential.Name)
+			if credential.Name == "Grok Web unmerged" {
+				return fmt.Errorf("%w: Cursor 身份未合并（cursorMerged=false）", provider.ErrConsoleNotMerged)
+			}
+			return nil
+		},
+	})
+	merged, _, err := accounts.UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO,
+		Name: "Grok Web merged", SourceKey: "sso:" + security.HashToken("merged-sso"),
+		EncryptedAccessToken: encrypt("merged-sso"), Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	unmerged, _, err := accounts.UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO,
+		Name: "Grok Web unmerged", SourceKey: "sso:" + security.HashToken("unmerged-sso"),
+		EncryptedAccessToken: encrypt("unmerged-sso"), Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.SyncWebAccountsToConsoleWithProgress(ctx, []uint64{merged.ID, unmerged.ID}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Created != 1 || result.Updated != 0 || result.Failed != 1 || len(result.AccountIDs) != 1 {
+		t.Fatalf("sync result = %#v", result)
+	}
+	if len(checked) != 2 {
+		t.Fatalf("eligibility checks = %d, want 2", len(checked))
+	}
+	_, total, err := accounts.List(ctx, repository.AccountListQuery{
+		Page: repository.PageQuery{Limit: 10}, Filter: repository.AccountListFilter{Provider: string(accountdomain.ProviderConsole)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if total != 1 {
+		t.Fatalf("console account count = %d, want 1 (unmerged account must not be persisted)", total)
+	}
+}
+
+func TestSyncWebAccountsToConsoleFailsWhenAllAccountsNotMerged(t *testing.T) {
+	ctx := context.Background()
+	service, accounts, encrypt := newEligibilityTestService(t, "web-console-gate-all.db", consoleEligibilityAdapter{
+		reject: func(accountdomain.Credential) error {
+			return fmt.Errorf("%w: Cursor 身份未合并（cursorMerged=false）", provider.ErrConsoleNotMerged)
+		},
+	})
+	webAccount, _, err := accounts.UpsertByIdentity(ctx, accountdomain.Credential{
+		Provider: accountdomain.ProviderWeb, AuthType: accountdomain.AuthTypeSSO,
+		Name: "Grok Web only", SourceKey: "sso:" + security.HashToken("only-sso"),
+		EncryptedAccessToken: encrypt("only-sso"), Enabled: true, AuthStatus: accountdomain.AuthStatusActive,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.SyncWebAccountsToConsoleWithProgress(ctx, []uint64{webAccount.ID}, nil, nil)
+	if !errors.Is(err, provider.ErrConsoleNotMerged) {
+		t.Fatalf("err = %v, want ErrConsoleNotMerged", err)
+	}
+	if result.Failed != 1 || result.Created != 0 {
+		t.Fatalf("sync result = %#v", result)
+	}
+	_, total, listErr := accounts.List(ctx, repository.AccountListQuery{
+		Page: repository.PageQuery{Limit: 10}, Filter: repository.AccountListFilter{Provider: string(accountdomain.ProviderConsole)},
+	})
+	if listErr != nil {
+		t.Fatal(listErr)
+	}
+	if total != 0 {
+		t.Fatalf("console account count = %d, want 0 (rejected account must not be persisted)", total)
+	}
 }

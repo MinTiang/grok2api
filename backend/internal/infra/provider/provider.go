@@ -24,6 +24,10 @@ var (
 	// ErrConsoleUnlinked accompanies ErrUnauthorized for Grok Console accounts
 	// never linked to Cursor; they have no Console credit pool at all.
 	ErrConsoleUnlinked = errors.New("grok console account not linked to cursor")
+	// ErrConsoleNotMerged marks a Grok Web account whose Cursor identity has not
+	// been merged upstream (RSC user.cursorMerged=false); it must not be synced
+	// to Console until the merge completes.
+	ErrConsoleNotMerged = errors.New("grok web account not cursor-merged")
 	// ErrEgressBlocked marks a request skipped locally because its egress is
 	// in a Cloudflare block cool-down; no upstream call was made.
 	ErrEgressBlocked       = errors.New("egress blocked by cloudflare, waiting for cool-down")
@@ -776,6 +780,13 @@ type AccountIdentityAdapter interface {
 	SyncAccountIdentity(ctx context.Context, credential account.Credential) (AccountIdentity, error)
 }
 
+// ConsoleEligibilityAdapter 由 Web Provider 实现：在 Web→Console 同步前用上游
+// 数据（RSC 首页账号快照）校验账号是否满足 Console 授权条件。
+type ConsoleEligibilityAdapter interface {
+	Adapter
+	CheckConsoleEligibility(ctx context.Context, credential account.Credential) error
+}
+
 type BuildCredentialConverter interface {
 	Adapter
 	ConvertToBuild(ctx context.Context, credential account.Credential) (CredentialSeed, error)
@@ -1200,6 +1211,15 @@ func (r *Registry) AccountIdentity(value account.Provider) (AccountIdentityAdapt
 		return nil, false
 	}
 	result, ok := adapter.(AccountIdentityAdapter)
+	return result, ok
+}
+
+func (r *Registry) ConsoleEligibility(value account.Provider) (ConsoleEligibilityAdapter, bool) {
+	adapter, ok := r.Get(value)
+	if !ok {
+		return nil, false
+	}
+	result, ok := adapter.(ConsoleEligibilityAdapter)
 	return result, ok
 }
 
