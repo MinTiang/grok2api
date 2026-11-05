@@ -39,18 +39,19 @@ func (h *Handler) Register(router *gin.RouterGroup) {
 }
 
 type configRequest struct {
-	Enabled             *bool   `json:"enabled"`
-	IntervalHours       *int    `json:"intervalHours"`
-	ChunkSize           *int    `json:"chunkSize"`
-	Workers             *int    `json:"workers"`
-	Model               *string `json:"model"`
-	Mode                *string `json:"mode"`
-	Prompt              *string `json:"prompt"`
-	MaxOutputTokens     *int    `json:"maxOutputTokens"`
-	EarlyStopOnThinking *bool   `json:"earlyStopOnThinking"`
-	EarlyStopDelayMS    *int    `json:"earlyStopDelayMs"`
-	CooldownHours       *int    `json:"cooldownHours"`
-	AutoDisable         *bool   `json:"autoDisable"`
+	Enabled             *bool    `json:"enabled"`
+	IntervalHours       *int     `json:"intervalHours"`
+	ChunkSize           *int     `json:"chunkSize"`
+	Workers             *int     `json:"workers"`
+	Model               *string  `json:"model"`
+	Mode                *string  `json:"mode"`
+	Prompt              *string  `json:"prompt"`
+	MaxOutputTokens     *int     `json:"maxOutputTokens"`
+	RatioThreshold      *float64 `json:"ratioThreshold"`
+	EarlyStopOnThinking *bool    `json:"earlyStopOnThinking"`
+	EarlyStopDelayMS    *int     `json:"earlyStopDelayMs"`
+	CooldownHours       *int     `json:"cooldownHours"`
+	AutoDisable         *bool    `json:"autoDisable"`
 }
 
 type runRequest struct {
@@ -69,6 +70,7 @@ func (h *Handler) status(c *gin.Context) {
 			"mode":                cfg.Mode,
 			"prompt":              cfg.Prompt,
 			"maxOutputTokens":     cfg.MaxOutputTokens,
+			"ratioThreshold":      cfg.RatioThreshold,
 			"clientKeyId":         cfg.ClientKeyID,
 			"earlyStopOnThinking": cfg.EarlyStopOnThinking,
 			"earlyStopDelayMs":    cfg.EarlyStopDelayMS,
@@ -97,6 +99,7 @@ func (h *Handler) updateConfig(c *gin.Context) {
 		Workers:             request.Workers,
 		MaxOutputTokens:     request.MaxOutputTokens,
 		EarlyStopOnThinking: request.EarlyStopOnThinking,
+		RatioThreshold:      request.RatioThreshold,
 		EarlyStopDelayMS:    request.EarlyStopDelayMS,
 		CooldownHours:       request.CooldownHours,
 		AutoDisable:         request.AutoDisable,

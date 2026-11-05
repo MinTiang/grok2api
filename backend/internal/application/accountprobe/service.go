@@ -40,6 +40,10 @@ const (
 	// The capability the probe tests by default is:
 	// harder signal than reasoning volume: it is visible the moment the call lands.
 	defaultMode = AccountProbeModeThinking
+	// accountProbeDefaultRatio is the encrypted bytes per claimed reasoning token a
+	// reply must reach. Calibrated for the default clock puzzle: healthy 4.4-5.0,
+	// degraded 1.6-2.0. A shorter prompt compresses both bands and needs its own value.
+	accountProbeDefaultRatio = 3.0
 	// probeTimeout bounds one account's whole probe, including its samples and the
 	// gap between them. Five thinking samples of 20-30s plus gaps need more than
 	// the single-sample budget this used to be.
@@ -91,18 +95,19 @@ type Prober interface {
 // let a stored document omit a value without forcing it to a zero that would
 // erase an intentional `false`.
 type PersistedConfig struct {
-	Enabled             *bool   `json:"enabled,omitempty"`
-	IntervalHours       *int    `json:"intervalHours,omitempty"`
-	ChunkSize           *int    `json:"chunkSize,omitempty"`
-	Workers             *int    `json:"workers,omitempty"`
-	Model               *string `json:"model,omitempty"`
-	Mode                *string `json:"mode,omitempty"`
-	Prompt              *string `json:"prompt,omitempty"`
-	MaxOutputTokens     *int    `json:"maxOutputTokens,omitempty"`
-	EarlyStopOnThinking *bool   `json:"earlyStopOnThinking,omitempty"`
-	EarlyStopDelayMS    *int    `json:"earlyStopDelayMs,omitempty"`
-	CooldownHours       *int    `json:"cooldownHours,omitempty"`
-	AutoDisable         *bool   `json:"autoDisable,omitempty"`
+	Enabled             *bool    `json:"enabled,omitempty"`
+	IntervalHours       *int     `json:"intervalHours,omitempty"`
+	ChunkSize           *int     `json:"chunkSize,omitempty"`
+	Workers             *int     `json:"workers,omitempty"`
+	Model               *string  `json:"model,omitempty"`
+	Mode                *string  `json:"mode,omitempty"`
+	Prompt              *string  `json:"prompt,omitempty"`
+	MaxOutputTokens     *int     `json:"maxOutputTokens,omitempty"`
+	RatioThreshold      *float64 `json:"ratioThreshold,omitempty"`
+	EarlyStopOnThinking *bool    `json:"earlyStopOnThinking,omitempty"`
+	EarlyStopDelayMS    *int     `json:"earlyStopDelayMs,omitempty"`
+	CooldownHours       *int     `json:"cooldownHours,omitempty"`
+	AutoDisable         *bool    `json:"autoDisable,omitempty"`
 }
 
 // Apply overlays the persisted values onto a configuration.
@@ -127,6 +132,9 @@ func (p PersistedConfig) Apply(cfg Config) Config {
 	}
 	if p.Prompt != nil {
 		cfg.Prompt = *p.Prompt
+	}
+	if p.RatioThreshold != nil && *p.RatioThreshold > 0 {
+		cfg.RatioThreshold = *p.RatioThreshold
 	}
 	if p.MaxOutputTokens != nil && *p.MaxOutputTokens > 0 {
 		cfg.MaxOutputTokens = *p.MaxOutputTokens
@@ -159,6 +167,7 @@ func FromConfig(cfg Config) PersistedConfig {
 		Mode:                &cfg.Mode,
 		Prompt:              &cfg.Prompt,
 		MaxOutputTokens:     &cfg.MaxOutputTokens,
+		RatioThreshold:      &cfg.RatioThreshold,
 		EarlyStopOnThinking: &cfg.EarlyStopOnThinking,
 		EarlyStopDelayMS:    &cfg.EarlyStopDelayMS,
 		CooldownHours:       &cooldownHours,
@@ -168,11 +177,13 @@ func FromConfig(cfg Config) PersistedConfig {
 
 // ProbeInput is the gateway-facing probe request.
 type ProbeInput struct {
-	AccountID           uint64
-	ClientKeyID         uint64
-	Model               string
-	Prompt              string
-	MaxOutputTokens     int
+	AccountID       uint64
+	ClientKeyID     uint64
+	Model           string
+	Prompt          string
+	MaxOutputTokens int
+	// RatioThreshold is the encrypted bytes required per claimed reasoning token.
+	RatioThreshold      float64
 	Mode                string
 	EarlyStopOnThinking bool
 	EarlyStopDelayMS    int
@@ -238,14 +249,16 @@ type IdentityResolver interface {
 
 // Config is the runtime configuration of the probe feature.
 type Config struct {
-	Enabled             bool
-	Interval            time.Duration
-	ChunkSize           int
-	Workers             int
-	Model               string
-	Mode                string
-	Prompt              string
-	MaxOutputTokens     int
+	Enabled         bool
+	Interval        time.Duration
+	ChunkSize       int
+	Workers         int
+	Model           string
+	Mode            string
+	Prompt          string
+	MaxOutputTokens int
+	// RatioThreshold is the encrypted bytes required per claimed reasoning token.
+	RatioThreshold      float64
 	ClientKeyID         uint64
 	EarlyStopOnThinking bool
 	EarlyStopDelayMS    int
@@ -419,6 +432,9 @@ func normalizeConfig(value Config) Config {
 	}
 	if value.Mode == "" {
 		value.Mode = defaultMode
+	}
+	if value.RatioThreshold <= 0 {
+		value.RatioThreshold = accountProbeDefaultRatio
 	}
 	if value.MaxOutputTokens <= 0 {
 		// Reasoning draws from the same budget as the visible answer, so this has
@@ -860,7 +876,7 @@ func (s *Service) probeOne(ctx context.Context, runID string, cfg Config, accoun
 
 	input := ProbeInput{
 		AccountID: accountID, ClientKeyID: cfg.ClientKeyID, Model: cfg.Model, Mode: cfg.Mode, Prompt: cfg.Prompt,
-		MaxOutputTokens: cfg.MaxOutputTokens, EarlyStopOnThinking: cfg.EarlyStopOnThinking,
+		MaxOutputTokens: cfg.MaxOutputTokens, RatioThreshold: cfg.RatioThreshold, EarlyStopOnThinking: cfg.EarlyStopOnThinking,
 		EarlyStopDelayMS: cfg.EarlyStopDelayMS,
 	}
 	var result ProbeResult

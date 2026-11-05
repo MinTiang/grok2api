@@ -190,3 +190,35 @@ func TestThinkingEvidenceScalesWithClaimedReasoning(t *testing.T) {
 		})
 	}
 }
+
+// TestEncryptionFloorCalibration pins the two calibrations that were measured on
+// a live fleet. The clock puzzle separates healthy at 4.4-5.0 bytes per claimed
+// reasoning token from degraded at 1.6-2.0, so 3.0 sits mid-gap. A short
+// arithmetic prompt compresses both bands to 4.9-5.7 and 2.1-2.7, which is why
+// the threshold has to travel with the prompt instead of being a constant.
+func TestEncryptionFloorCalibration(t *testing.T) {
+	cases := []struct {
+		name     string
+		perToken float64
+		tokens   int64
+		encBytes int
+		want     bool
+	}{
+		{"clock prompt, healthy 4.5 ratio", 3, 2000, 9000, true},
+		{"clock prompt, degraded 1.8 ratio", 3, 2000, 3600, false},
+		{"clock prompt, degraded upper 2.0", 3, 2000, 4000, false},
+		{"short prompt, healthy 5.0 ratio", 3.8, 300, 1500, true},
+		{"short prompt, degraded 2.7 ratio", 3.8, 300, 810, false},
+		{"zero tokens needs only the minimum", 3, 0, 260, true},
+		{"zero tokens under the minimum", 3, 0, 100, false},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			floor := accountProbeEncryptionFloor(testCase.perToken, testCase.tokens)
+			got := int64(testCase.encBytes) >= floor
+			if got != testCase.want {
+				t.Fatalf("floor=%d encBytes=%d => %v, want %v", floor, testCase.encBytes, got, testCase.want)
+			}
+		})
+	}
+}

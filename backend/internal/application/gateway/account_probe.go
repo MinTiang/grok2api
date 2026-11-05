@@ -57,6 +57,13 @@ type AccountProbeInput struct {
 	Model           string
 	Prompt          string
 	MaxOutputTokens int
+	// MinBytesPerToken is the encrypted-reasoning bytes required per claimed
+	// reasoning token before a reply counts as having really thought. It is a
+	// parameter rather than a constant because the right value depends on the
+	// prompt: the clock puzzle separates at 3.0, while a short arithmetic prompt
+	// compresses the degraded band up to 2.7 and needs about 4.0. Zero uses the
+	// tuned default.
+	MinBytesPerToken float64
 	// Mode selects the capability under test. Empty means tool mode.
 	Mode string
 	// EarlyStopOnThinking stops reading as soon as reasoning evidence arrives.
@@ -432,7 +439,7 @@ func (s *Service) ProbeAccount(ctx context.Context, input AccountProbeInput) (Ac
 	result.ReasoningDeltaBytes = reasoningDeltaBytes
 	result.EncryptedBytes = encryptedBytes
 	result.ReasoningBytes = max(reasoningDeltaBytes, encryptedBytes)
-	encryptionFloor := encryptedThinkingFloor(accountProbeMinEncryptedBytes, accountProbeEncryptedBytesPerToken, usage.ReasoningTokens)
+	encryptionFloor := accountProbeEncryptionFloor(input.MinBytesPerToken, usage.ReasoningTokens)
 	result.EncryptionFloor = encryptionFloor
 	if usage.ReasoningTokens > 0 {
 		result.ReasoningRatio = math.Round(float64(encryptedBytes)/float64(usage.ReasoningTokens)*100) / 100
@@ -568,7 +575,7 @@ const (
 	// sides; the previous value of 4 left only 0.46 above the healthy floor and
 	// would misjudge a healthy account that dipped.
 	accountProbeMinEncryptedBytes      = 256
-	accountProbeEncryptedBytesPerToken = 3
+	accountProbeEncryptedBytesPerToken = 3.0
 	// accountProbeThinkingThreshold is the first-visible-token delay that counts
 	// as evidence of thinking. A model that reasons emits its first visible token
 	// well after this; a degraded account dumps the answer immediately. It is the
@@ -844,6 +851,24 @@ func normalizeAccountProbeMode(value string) string {
 		return AccountProbeModeThinking
 	}
 	return AccountProbeModeTool
+}
+
+// accountProbeEncryptionFloor is the encrypted-reasoning payload a reply has to
+// reach, given how many reasoning tokens it claims. Calibrated per prompt, since
+// the degraded band shifts when the question changes.
+func accountProbeEncryptionFloor(bytesPerToken float64, reasoningTokens int64) int64 {
+	floor := int64(accountProbeMinEncryptedBytes)
+	if bytesPerToken <= 0 {
+		bytesPerToken = accountProbeEncryptedBytesPerToken
+	}
+	if reasoningTokens <= 0 {
+		return floor
+	}
+	need := int64(float64(reasoningTokens) * bytesPerToken)
+	if need > floor {
+		return need
+	}
+	return floor
 }
 
 // truncateAccountProbeAnswer keeps a short, safe prefix of the visible answer.

@@ -87,11 +87,11 @@ type AccountProbeConfig struct {
 	ChunkSize int `yaml:"chunkSize"`
 	// Workers caps probe concurrency. Keep it low: aggressive probing is itself
 	// the kind of traffic pattern risk control reacts to.
-	Workers     int    `yaml:"workers"`
-	Model       string `yaml:"model"`
-	Prompt      string `yaml:"prompt"`
+	Workers     int      `yaml:"workers"`
+	Model       string   `yaml:"model"`
+	Prompt      string   `yaml:"prompt"`
 	Cooldown    Duration `yaml:"cooldown"`
-	AutoDisable bool   `yaml:"autoDisable"`
+	AutoDisable bool     `yaml:"autoDisable"`
 	// MaxOutputTokens caps the reply. The probe stops as soon as reasoning
 	// appears, so this only bounds a degraded account.
 	MaxOutputTokens int `yaml:"maxOutputTokens"`
@@ -102,6 +102,13 @@ type AccountProbeConfig struct {
 	// EarlyStopDelay is held after reasoning first appears before cutting the
 	// stream, so a partial reasoning chunk is not mistaken for a full thought.
 	EarlyStopDelay Duration `yaml:"earlyStopDelay"`
+	// Mode selects what the probe measures: "thinking" for reasoning integrity,
+	// "tool" for tool-calling capability.
+	Mode string `yaml:"mode"`
+	// RatioThreshold is the encrypted-reasoning bytes required per claimed
+	// reasoning token. It is coupled to the prompt, so recalibrate when either
+	// the prompt or the model changes.
+	RatioThreshold float64 `yaml:"ratioThreshold"`
 }
 
 type ServerConfig struct {

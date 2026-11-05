@@ -38,6 +38,8 @@ func accountProbeConfig(value config.AccountProbeConfig, identityID uint64) acco
 		Workers:             value.Workers,
 		Model:               value.Model,
 		Prompt:              value.Prompt,
+		Mode:                value.Mode,
+		RatioThreshold:      value.RatioThreshold,
 		MaxOutputTokens:     value.MaxOutputTokens,
 		ClientKeyID:         identityID,
 		EarlyStopOnThinking: true,
@@ -110,6 +112,7 @@ func (a *accountProbeAdapter) probe(ctx context.Context, input accountprobe.Prob
 			Mode:                input.Mode,
 			Prompt:              input.Prompt,
 			MaxOutputTokens:     input.MaxOutputTokens,
+			MinBytesPerToken:    input.RatioThreshold,
 			EarlyStopOnThinking: input.EarlyStopOnThinking,
 			EarlyStopDelayMS:    input.EarlyStopDelayMS,
 		})
