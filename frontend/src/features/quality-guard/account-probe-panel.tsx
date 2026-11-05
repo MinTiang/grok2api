@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Activity, Ban, FlaskConical, Play, RefreshCw, Square, TimerReset } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { toast } from "sonner";
 
@@ -22,6 +22,7 @@ import {
   stopAccountProbe,
   updateAccountProbeConfig,
   type AccountProbeConfig,
+  type AccountProbeEditableConfig,
   type AccountProbeResult,
   type AccountProbeVerdict,
 } from "./account-probe-api";
@@ -78,15 +79,25 @@ export function AccountProbePanel({ accountIds }: { accountIds?: number[] } = {}
     refetchInterval: (query) => (query.state.data?.runs?.some((run) => run.running) ? 2000 : false),
   });
 
-  useEffect(() => {
-    if (query.data && !draft) {
-      setDraft(query.data.config);
-    }
-  }, [query.data, draft]);
-
+  // `draft` only holds user edits. The rendered config falls back to the server
+  // value, which removes the need to seed state from an effect and keeps the form
+  // in sync whenever a refetch lands.
   const saveMutation = useMutation({
     mutationFn: (input: AccountProbeConfig) => {
-      const { clientKeyId: _clientKeyId, ...editable } = input;
+      // clientKeyId is server-managed; drop it so the panel can never submit it.
+      const editable: AccountProbeEditableConfig = {
+        enabled: input.enabled,
+        intervalHours: input.intervalHours,
+        chunkSize: input.chunkSize,
+        workers: input.workers,
+        model: input.model,
+        prompt: input.prompt,
+        maxOutputTokens: input.maxOutputTokens,
+        earlyStopOnThinking: input.earlyStopOnThinking,
+        earlyStopDelayMs: input.earlyStopDelayMs,
+        cooldownHours: input.cooldownHours,
+        autoDisable: input.autoDisable,
+      };
       return updateAccountProbeConfig(editable);
     },
     onSuccess: async () => {
@@ -122,7 +133,10 @@ export function AccountProbePanel({ accountIds }: { accountIds?: number[] } = {}
 
   const runs = query.data?.runs ?? [];
   const activeRun = runs.find((run) => run.running);
-  const latestResults = activeRun?.results?.length ? activeRun.results : query.data?.recent ?? [];
+  const latestResults = useMemo(
+    () => (activeRun?.results?.length ? activeRun.results : query.data?.recent ?? []),
+    [activeRun, query.data],
+  );
   // The counters come from the run summary while one is in flight, because
   // `results` only holds finished accounts and would make a half-done sweep look
   // like a tiny one. The recent list is a flat history, so count it locally.

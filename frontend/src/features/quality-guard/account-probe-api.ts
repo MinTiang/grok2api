@@ -1,5 +1,15 @@
 import { apiRequest } from "@/shared/api/client";
-import { createObjectDecoder, isArrayOf, isBoolean, isNumber, isOptional, isOneOf, isString } from "@/shared/api/decoder";
+import {
+  createObjectDecoder,
+  createValidatedDecoder,
+  hasShape,
+  isArrayOf,
+  isBoolean,
+  isNumber,
+  isOptional,
+  isOneOf,
+  isString,
+} from "@/shared/api/decoder";
 
 export const accountProbePath = "/api/admin/v1/account-probe";
 
@@ -71,22 +81,7 @@ export type AccountProbeStatus = {
   runs: AccountProbeRun[];
 };
 
-const configDecoder = createObjectDecoder<AccountProbeConfig>("accountProbeConfig", {
-  enabled: isBoolean,
-  intervalHours: isNumber,
-  chunkSize: isNumber,
-  workers: isNumber,
-  model: isString,
-  prompt: isString,
-  maxOutputTokens: isNumber,
-  clientKeyId: isNumber,
-  earlyStopOnThinking: isBoolean,
-  earlyStopDelayMs: isNumber,
-  cooldownHours: isNumber,
-  autoDisable: isBoolean,
-});
-
-const resultDecoder = createObjectDecoder<AccountProbeResult>("accountProbeResult", {
+const resultShape = hasShape({
   accountId: isNumber,
   accountName: isString,
   email: isString,
@@ -110,7 +105,7 @@ const resultDecoder = createObjectDecoder<AccountProbeResult>("accountProbeResul
   probedAt: isString,
 });
 
-const runDecoder = createObjectDecoder<AccountProbeRun>("accountProbeRun", {
+const runShape = hasShape({
   id: isString,
   trigger: isString,
   startedAt: isString,
@@ -124,13 +119,33 @@ const runDecoder = createObjectDecoder<AccountProbeRun>("accountProbeRun", {
   penalized: isNumber,
   running: isBoolean,
   lastError: isOptional(isString),
-  results: isArrayOf(resultDecoder),
+  results: isArrayOf(resultShape),
 });
 
+const configShape = hasShape({
+  enabled: isBoolean,
+  intervalHours: isNumber,
+  chunkSize: isNumber,
+  workers: isNumber,
+  model: isString,
+  prompt: isString,
+  maxOutputTokens: isNumber,
+  clientKeyId: isNumber,
+  earlyStopOnThinking: isBoolean,
+  earlyStopDelayMs: isNumber,
+  cooldownHours: isNumber,
+  autoDisable: isBoolean,
+});
+
+// Decoder shapes are predicates, not decoders: nested objects go through
+// hasShape(...) and lists through isArrayOf(shape). Handing one decoder to
+// createObjectDecoder does not type-check.
+const runDecoder = createValidatedDecoder<AccountProbeRun>("accountProbeRun", runShape);
+
 const statusDecoder = createObjectDecoder<AccountProbeStatus>("accountProbeStatus", {
-  config: configDecoder,
-  recent: isArrayOf(resultDecoder),
-  runs: isArrayOf(runDecoder),
+  config: configShape,
+  recent: isArrayOf(resultShape),
+  runs: isArrayOf(runShape),
 });
 
 export async function fetchAccountProbeStatus(): Promise<AccountProbeStatus> {
