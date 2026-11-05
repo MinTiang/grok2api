@@ -91,8 +91,10 @@ export function AccountProbePanel({ accountIds }: { accountIds?: number[] } = {}
         chunkSize: input.chunkSize,
         workers: input.workers,
         model: input.model,
+        mode: input.mode,
         prompt: input.prompt,
         maxOutputTokens: input.maxOutputTokens,
+        ratioThreshold: input.ratioThreshold,
         earlyStopOnThinking: input.earlyStopOnThinking,
         earlyStopDelayMs: input.earlyStopDelayMs,
         cooldownHours: input.cooldownHours,
@@ -279,6 +281,18 @@ export function AccountProbePanel({ accountIds }: { accountIds?: number[] } = {}
                 min={128}
                 value={config.maxOutputTokens}
                 onChange={(event) => setDraft({ ...config, maxOutputTokens: Number(event.target.value) })}
+              />
+            </label>
+            <label className="space-y-1.5">
+              <span className="text-xs font-medium text-muted-foreground">{t("accountProbe.ratioThreshold", "判据阈值 (字节/token)")}</span>
+              <Input
+                type="number"
+                step={0.1}
+                min={0.5}
+                // Coupled to the prompt: 3.0 fits the clock puzzle, ~3.8 fits a short
+                // arithmetic question. Recalibrate whenever the prompt changes.
+                value={config.ratioThreshold}
+                onChange={(event) => setDraft({ ...config, ratioThreshold: Number(event.target.value) })}
               />
             </label>
             <label className="space-y-1.5">

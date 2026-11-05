@@ -21,8 +21,15 @@ export type AccountProbeConfig = {
   chunkSize: number;
   workers: number;
   model: string;
+  /** "thinking" judges reasoning integrity, "tool" judges tool calling. */
+  mode: string;
   prompt: string;
   maxOutputTokens: number;
+  /**
+   * Encrypted bytes required per claimed reasoning token. Coupled to the prompt:
+   * 3.0 for the clock puzzle, about 3.8 for a short arithmetic question.
+   */
+  ratioThreshold: number;
   /** Read-only: the server funds probes from its own managed identity. */
   clientKeyId: number;
   earlyStopOnThinking: boolean;
@@ -144,8 +151,10 @@ const configShape = hasShape({
   chunkSize: isNumber,
   workers: isNumber,
   model: isString,
+  mode: isString,
   prompt: isString,
   maxOutputTokens: isNumber,
+  ratioThreshold: isNumber,
   clientKeyId: isNumber,
   earlyStopOnThinking: isBoolean,
   earlyStopDelayMs: isNumber,
