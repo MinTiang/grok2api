@@ -73,6 +73,10 @@ type AccountProbeResult struct {
 	// the encrypted side is what separates a real trace from a stub.
 	ReasoningDeltaBytes int `json:"reasoningDeltaBytes"`
 	EncryptedBytes      int `json:"encryptedBytes"`
+	// FirstVisibleMS is when the first visible token arrived. Diagnostics only:
+	// measured on real accounts, degraded ones delay their answer just as long as
+	// healthy ones, so it cannot decide a verdict.
+	FirstVisibleMS int64 `json:"firstVisibleMs"`
 	// EncryptionFloor is the encrypted length this reply had to reach, derived
 	// from its own claimed reasoning tokens. Surfacing it makes a rejection
 	// explainable instead of a bare verdict.
@@ -214,6 +218,10 @@ func (s *Service) ProbeAccount(ctx context.Context, input AccountProbeInput) (Ac
 	var visible strings.Builder
 	reasoningDeltaBytes := 0
 	encryptedBytes := 0
+	var firstVisibleAt time.Time
+	// FirstVisibleMS is recorded for diagnostics only. Measurement across real
+	// accounts showed degraded ones hold their answer back just as long as healthy
+	// ones, so this delay cannot decide a verdict and nothing stops early on it.
 	totalBytes := 0
 	earlyStop := false
 	earlyStopDelay := time.Duration(input.EarlyStopDelayMS) * time.Millisecond
@@ -277,6 +285,9 @@ func (s *Service) ProbeAccount(ctx context.Context, input AccountProbeInput) (Ac
 		for _, choice := range event.Choices {
 			delta := choice.Delta
 			if delta.Content != "" {
+				if firstVisibleAt.IsZero() {
+					firstVisibleAt = time.Now()
+				}
 				visible.WriteString(delta.Content)
 			}
 			// Plaintext reasoning deltas: the strongest signal, because a degraded
@@ -296,8 +307,8 @@ func (s *Service) ProbeAccount(ctx context.Context, input AccountProbeInput) (Ac
 				}
 			}
 		}
-		// Stop as soon as reasoning is proven present. The remaining reply is
-		// pure cost: the verdict is already decided.
+		// Fallback for a reply that only streams reasoning: wait for the delay
+		// after reasoning appears so a partially streamed thought is not judged.
 		if input.EarlyStopOnThinking && !firstReasoningAt.IsZero() && time.Since(firstReasoningAt) >= earlyStopDelay {
 			earlyStop = true
 			break
@@ -321,6 +332,9 @@ func (s *Service) ProbeAccount(ctx context.Context, input AccountProbeInput) (Ac
 	result.ReasoningTokens = usage.ReasoningTokens
 	result.VisibleChars = len(visible.String())
 	result.EarlyStop = earlyStop
+	if !firstVisibleAt.IsZero() {
+		result.FirstVisibleMS = firstVisibleAt.Sub(startedAt).Milliseconds()
+	}
 	if !firstGeneratedAt.IsZero() {
 		result.FirstTokenMS = firstGeneratedAt.Sub(startedAt).Milliseconds()
 	}
@@ -333,11 +347,15 @@ func (s *Service) ProbeAccount(ctx context.Context, input AccountProbeInput) (Ac
 		result.OutputTPS = qualityProbeOutputTokensPerSecond(usage.OutputTokens, usage.ReasoningTokens, result.DurationMS, result.FirstTokenMS)
 	}
 
+	// The verdict comes from the completed reply: the only signal that separates a
+	// real trace from a stub is the encrypted payload measured against the
+	// reasoning tokens the reply claims, and both arrive at the tail.
 	result.Verdict, result.Reason = classifyAccountProbeResult(result)
 	return result, nil
 }
 
-// classifyAccountProbeResult decides the verdict from thinking presence only.
+// classifyAccountProbeResult is the fallback for a stream that ended without ever
+// producing a visible token, so the first-visible-token latency could not decide.
 //
 // Usage.reasoning_tokens is not proof of thinking: degraded accounts report
 // hundreds of reasoning tokens while the stream never carries reasoning deltas.
@@ -407,6 +425,12 @@ const (
 	// or it is a stub. These mirror the request-path classifier's defaults.
 	accountProbeMinEncryptedBytes      = 256
 	accountProbeEncryptedBytesPerToken = 4
+	// accountProbeThinkingThreshold is the first-visible-token delay that counts
+	// as evidence of thinking. A model that reasons emits its first visible token
+	// well after this; a degraded account dumps the answer immediately. It is the
+	// only verdict signal available while the stream is still open, so the probe
+	// can decide and stop instead of paying for the whole reply.
+	accountProbeThinkingThreshold = 3 * time.Second
 )
 
 // IsAccountProbePenalizable reports whether a verdict should cool the account.

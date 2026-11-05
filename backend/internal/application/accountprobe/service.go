@@ -155,6 +155,7 @@ type ProbeResult struct {
 	ReasoningDeltaBytes int
 	EncryptedBytes      int
 	EncryptionFloor     int64
+	FirstVisibleMS      int64
 	OutputTokens        int64
 	ReasoningTokens     int64
 	VisibleChars        int
@@ -222,6 +223,7 @@ type ResultView struct {
 	ReasoningDeltaBytes int       `json:"reasoningDeltaBytes"`
 	EncryptedBytes      int       `json:"encryptedBytes"`
 	EncryptionFloor     int64     `json:"encryptionFloor"`
+	FirstVisibleMS      int64     `json:"firstVisibleMs"`
 	OutputTokens        int64     `json:"outputTokens"`
 	ReasoningTokens     int64     `json:"reasoningTokens"`
 	VisibleChars        int       `json:"visibleChars"`
@@ -658,6 +660,7 @@ func (s *Service) probeOne(ctx context.Context, runID string, cfg Config, accoun
 			HasThinking: result.HasThinking, ReasoningBytes: result.ReasoningBytes,
 			ReasoningDeltaBytes: result.ReasoningDeltaBytes, EncryptedBytes: result.EncryptedBytes,
 			EncryptionFloor: result.EncryptionFloor,
+			FirstVisibleMS:  result.FirstVisibleMS,
 			OutputTokens:    result.OutputTokens, ReasoningTokens: result.ReasoningTokens,
 			VisibleChars: result.VisibleChars, FirstTokenMS: result.FirstTokenMS,
 			DurationMS: result.DurationMS, OutputTPS: result.OutputTPS,
@@ -687,7 +690,7 @@ func (s *Service) probeOne(ctx context.Context, runID string, cfg Config, accoun
 	s.logger.Info("account_probe_done",
 		"account_id", accountID, "verdict", view.Verdict, "has_thinking", view.HasThinking,
 		"reasoning_bytes", view.ReasoningBytes, "output_tokens", view.OutputTokens,
-		"early_stop", view.EarlyStop, "penalized", view.Penalized)
+		"first_visible_ms", view.FirstVisibleMS, "early_stop", view.EarlyStop, "penalized", view.Penalized)
 }
 
 // recordResult appends one probe outcome to the run counters and the recent
