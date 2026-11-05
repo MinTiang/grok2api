@@ -450,14 +450,14 @@ export function AccountProbePanel({ accountIds }: { accountIds?: number[] } = {}
                   </TableCell>
                   <TableCell className="tabular-nums">
                     <div>{item.reasoningBytes}</div>
-                    {/* Show where the evidence came from: a plaintext delta is
-                        conclusive, an encrypted blob only counts above the floor. */}
-                    <div className="text-xs text-muted-foreground">
-                      {/* Concatenated rather than interpolated: this project has no
-                          i18n resource files and t() takes a plain default string. */}
+                    {/* The ratio is the whole verdict: healthy accounts carry
+                        ~4.5-4.9 bytes of encrypted reasoning per claimed token,
+                        degraded ones ~1.6-1.9. Showing it makes the separation
+                        visible instead of asking anyone to trust a label. */}
+                    <div className={cn("text-xs", item.reasoningRatio > 0 && item.reasoningRatio < 3 ? "text-amber-600" : "text-muted-foreground")}>
                       {item.reasoningDeltaBytes > 0
                         ? `${t("accountProbe.reasoningPlain", "明文")} ${item.reasoningDeltaBytes}`
-                        : `${t("accountProbe.reasoningEncrypted", "加密")} ${item.encryptedBytes} / ${item.encryptionFloor}`}
+                        : `${t("accountProbe.reasoningRatio", "比值")} ${item.reasoningRatio || "-"}`}
                     </div>
                   </TableCell>
                   <TableCell className="tabular-nums">{item.outputTokens}</TableCell>

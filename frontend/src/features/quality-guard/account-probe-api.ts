@@ -49,6 +49,12 @@ export type AccountProbeResult = {
   encryptedBytes: number;
   /** Encrypted length this reply had to reach, from its own reasoning tokens. */
   encryptionFloor: number;
+  /**
+   * Encrypted-reasoning bytes per claimed reasoning token. Healthy accounts sit
+   * near 4.5-4.9 and degraded ones near 1.6-1.9, so this single number explains
+   * the verdict.
+   */
+  reasoningRatio: number;
   outputTokens: number;
   reasoningTokens: number;
   visibleChars: number;
@@ -99,6 +105,7 @@ const resultShape = hasShape({
   reasoningDeltaBytes: isNumber,
   encryptedBytes: isNumber,
   encryptionFloor: isNumber,
+  reasoningRatio: isNumber,
   outputTokens: isNumber,
   reasoningTokens: isNumber,
   visibleChars: isNumber,
