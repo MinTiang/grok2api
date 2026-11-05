@@ -442,7 +442,16 @@ export function AccountProbePanel({ accountIds }: { accountIds?: number[] } = {}
                     </span>
                     {item.penalized ? <div className="mt-1 text-xs text-muted-foreground">{t("accountProbe.penalized", "已冷却")}</div> : null}
                   </TableCell>
-                  <TableCell className="tabular-nums">{item.reasoningBytes}</TableCell>
+                  <TableCell className="tabular-nums">
+                    <div>{item.reasoningBytes}</div>
+                    {/* Show where the evidence came from: a plaintext delta is
+                        conclusive, an encrypted blob only counts above the floor. */}
+                    <div className="text-xs text-muted-foreground">
+                      {item.reasoningDeltaBytes > 0
+                        ? t("accountProbe.reasoningPlain", "明文 {n}", { n: item.reasoningDeltaBytes })
+                        : t("accountProbe.reasoningEncrypted", "加密 {n}", { n: item.encryptedBytes })}
+                    </div>
+                  </TableCell>
                   <TableCell className="tabular-nums">{item.outputTokens}</TableCell>
                   <TableCell className="tabular-nums">{item.outputTps ? item.outputTps.toFixed(0) : "-"}</TableCell>
                   <TableCell className="text-xs text-muted-foreground">

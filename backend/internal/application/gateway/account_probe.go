@@ -57,27 +57,33 @@ type AccountProbeInput struct {
 
 // AccountProbeResult reports one account probe outcome.
 type AccountProbeResult struct {
-	AccountID       uint64    `json:"accountId"`
-	AccountName     string    `json:"accountName"`
-	Email           string    `json:"email"`
-	Verdict         string    `json:"verdict"`
-	Reason          string    `json:"reason"`
-	StatusCode      int       `json:"statusCode"`
-	HasThinking     bool      `json:"hasThinking"`
-	ReasoningBytes  int       `json:"reasoningBytes"`
-	OutputTokens    int64     `json:"outputTokens"`
-	ReasoningTokens int64     `json:"reasoningTokens"`
-	VisibleChars    int       `json:"visibleChars"`
-	FirstTokenMS    int64     `json:"firstTokenMs"`
-	DurationMS      int64     `json:"durationMs"`
-	GenerationMS    int64     `json:"generationMs"`
-	OutputTPS       float64   `json:"outputTps"`
-	EgressNodeID    uint64    `json:"egressNodeId"`
-	EgressNodeName  string    `json:"egressNodeName"`
-	EarlyStop       bool      `json:"earlyStop"`
-	Model           string    `json:"model"`
-	Error           string    `json:"error,omitempty"`
-	ProbedAt        time.Time `json:"probedAt"`
+	AccountID      uint64 `json:"accountId"`
+	AccountName    string `json:"accountName"`
+	Email          string `json:"email"`
+	Verdict        string `json:"verdict"`
+	Reason         string `json:"reason"`
+	StatusCode     int    `json:"statusCode"`
+	HasThinking    bool   `json:"hasThinking"`
+	ReasoningBytes int    `json:"reasoningBytes"`
+	// ReasoningDeltaBytes counts plaintext reasoning deltas only, and
+	// EncryptedBytes the encrypted-reasoning payload length. They are kept apart
+	// because a degraded account can still ship an encrypted blob: the floor on
+	// the encrypted side is what separates a real trace from a stub.
+	ReasoningDeltaBytes int       `json:"reasoningDeltaBytes"`
+	EncryptedBytes      int       `json:"encryptedBytes"`
+	OutputTokens        int64     `json:"outputTokens"`
+	ReasoningTokens     int64     `json:"reasoningTokens"`
+	VisibleChars        int       `json:"visibleChars"`
+	FirstTokenMS        int64     `json:"firstTokenMs"`
+	DurationMS          int64     `json:"durationMs"`
+	GenerationMS        int64     `json:"generationMs"`
+	OutputTPS           float64   `json:"outputTps"`
+	EgressNodeID        uint64    `json:"egressNodeId"`
+	EgressNodeName      string    `json:"egressNodeName"`
+	EarlyStop           bool      `json:"earlyStop"`
+	Model               string    `json:"model"`
+	Error               string    `json:"error,omitempty"`
+	ProbedAt            time.Time `json:"probedAt"`
 }
 
 // ProbeAccount runs one short streamed chat against a single pinned account.
@@ -200,7 +206,8 @@ func (s *Service) ProbeAccount(ctx context.Context, input AccountProbeInput) (Ac
 	var firstGeneratedAt time.Time
 	var firstReasoningAt time.Time
 	var visible strings.Builder
-	reasoningBytes := 0
+	reasoningDeltaBytes := 0
+	encryptedBytes := 0
 	totalBytes := 0
 	earlyStop := false
 	earlyStopDelay := time.Duration(input.EarlyStopDelayMS) * time.Millisecond
@@ -218,10 +225,9 @@ func (s *Service) ProbeAccount(ctx context.Context, input AccountProbeInput) (Ac
 			break
 		}
 		trimmed := strings.TrimSpace(string(line))
-		// Build streams to Chat Completions never carry reasoning text in
-		// delta.reasoning: the converter emits an empty stub comment plus the
-		// encrypted-content length instead. Both markers are comments that SSE
-		// clients ignore, so they are the only in-band proof of thinking.
+		// Two markers matter. The start stub proves nothing on its own: a
+		// degraded account emits it too, so it only anchors first-token timing.
+		// The evidence line carries the encrypted-reasoning payload length.
 		if trimmed == qualityReasoningSSEComment {
 			if firstGeneratedAt.IsZero() {
 				firstGeneratedAt = time.Now()
@@ -232,8 +238,8 @@ func (s *Service) ProbeAccount(ctx context.Context, input AccountProbeInput) (Ac
 			continue
 		}
 		if evidence, ok := parseReasoningEvidenceComment(trimmed); ok {
-			if evidence > reasoningBytes {
-				reasoningBytes = evidence
+			if evidence > encryptedBytes {
+				encryptedBytes = evidence
 			}
 			if firstReasoningAt.IsZero() {
 				firstReasoningAt = time.Now()
@@ -267,11 +273,12 @@ func (s *Service) ProbeAccount(ctx context.Context, input AccountProbeInput) (Ac
 			if delta.Content != "" {
 				visible.WriteString(delta.Content)
 			}
-			// Kept for providers that do stream plaintext reasoning deltas; on
-			// Build this is always empty and the comment markers above decide.
+			// Plaintext reasoning deltas: the strongest signal, because a degraded
+			// account ships none. Build reaches this path when the converter emits
+			// reasoning_content for OperationChat.
 			reasoning := delta.Reasoning + delta.ReasoningContent + delta.ThinkingContent
 			if reasoning != "" {
-				reasoningBytes += len(reasoning)
+				reasoningDeltaBytes += len(reasoning)
 				if firstReasoningAt.IsZero() {
 					firstReasoningAt = time.Now()
 				}
@@ -292,10 +299,14 @@ func (s *Service) ProbeAccount(ctx context.Context, input AccountProbeInput) (Ac
 	}
 
 	completedAt := time.Now()
-	// Only streamed reasoning deltas prove thinking. usage.reasoning_tokens is
-	// recorded for diagnostics but never promotes a verdict on its own.
-	result.HasThinking = reasoningBytes > 0
-	result.ReasoningBytes = reasoningBytes
+	// Plaintext reasoning deltas are conclusive. When the converter sends only
+	// encrypted reasoning, its payload length stands in, but only above a floor:
+	// a degraded account can still attach a short signature blob, so a bare
+	// non-zero length proves nothing. usage.reasoning_tokens never decides.
+	result.ReasoningDeltaBytes = reasoningDeltaBytes
+	result.EncryptedBytes = encryptedBytes
+	result.HasThinking = reasoningDeltaBytes > 0 || encryptedBytes >= accountProbeMinEncryptedBytes
+	result.ReasoningBytes = max(reasoningDeltaBytes, encryptedBytes)
 	result.OutputTokens = usage.OutputTokens
 	result.ReasoningTokens = usage.ReasoningTokens
 	result.VisibleChars = len(visible.String())
@@ -380,6 +391,10 @@ const (
 	// Anything below this is treated as unset: reasoning needs room to stream
 	// before the visible answer starts.
 	accountProbeMinOutputTokens = 128
+	// Encrypted reasoning must reach this size to count as proof. The request-path
+	// classifier uses the same floor for the same reason: a signature blob is
+	// shipped by degraded accounts as well.
+	accountProbeMinEncryptedBytes = 256
 )
 
 // IsAccountProbePenalizable reports whether a verdict should cool the account.

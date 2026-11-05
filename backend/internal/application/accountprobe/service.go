@@ -144,27 +144,29 @@ type ProbeInput struct {
 
 // ProbeResult is the gateway-facing probe outcome.
 type ProbeResult struct {
-	AccountID       uint64
-	AccountName     string
-	Email           string
-	Verdict         string
-	Reason          string
-	StatusCode      int
-	HasThinking     bool
-	ReasoningBytes  int
-	OutputTokens    int64
-	ReasoningTokens int64
-	VisibleChars    int
-	FirstTokenMS    int64
-	DurationMS      int64
-	GenerationMS    int64
-	OutputTPS       float64
-	EgressNodeID    uint64
-	EgressNodeName  string
-	EarlyStop       bool
-	Model           string
-	Error           string
-	ProbedAt        time.Time
+	AccountID           uint64
+	AccountName         string
+	Email               string
+	Verdict             string
+	Reason              string
+	StatusCode          int
+	HasThinking         bool
+	ReasoningBytes      int
+	ReasoningDeltaBytes int
+	EncryptedBytes      int
+	OutputTokens        int64
+	ReasoningTokens     int64
+	VisibleChars        int
+	FirstTokenMS        int64
+	DurationMS          int64
+	GenerationMS        int64
+	OutputTPS           float64
+	EgressNodeID        uint64
+	EgressNodeName      string
+	EarlyStop           bool
+	Model               string
+	Error               string
+	ProbedAt            time.Time
 }
 
 // Penalizer applies the missing-thinking penalty to one account.
@@ -208,27 +210,29 @@ type Config struct {
 
 // ResultView is one panel-facing probe row.
 type ResultView struct {
-	AccountID       uint64    `json:"accountId"`
-	AccountName     string    `json:"accountName"`
-	Email           string    `json:"email"`
-	Verdict         string    `json:"verdict"`
-	Reason          string    `json:"reason"`
-	StatusCode      int       `json:"statusCode"`
-	HasThinking     bool      `json:"hasThinking"`
-	ReasoningBytes  int       `json:"reasoningBytes"`
-	OutputTokens    int64     `json:"outputTokens"`
-	ReasoningTokens int64     `json:"reasoningTokens"`
-	VisibleChars    int       `json:"visibleChars"`
-	FirstTokenMS    int64     `json:"firstTokenMs"`
-	DurationMS      int64     `json:"durationMs"`
-	OutputTPS       float64   `json:"outputTps"`
-	EgressNodeID    uint64    `json:"egressNodeId"`
-	EgressNodeName  string    `json:"egressNodeName"`
-	EarlyStop       bool      `json:"earlyStop"`
-	Model           string    `json:"model"`
-	Error           string    `json:"error,omitempty"`
-	Penalized       bool      `json:"penalized"`
-	ProbedAt        time.Time `json:"probedAt"`
+	AccountID           uint64    `json:"accountId"`
+	AccountName         string    `json:"accountName"`
+	Email               string    `json:"email"`
+	Verdict             string    `json:"verdict"`
+	Reason              string    `json:"reason"`
+	StatusCode          int       `json:"statusCode"`
+	HasThinking         bool      `json:"hasThinking"`
+	ReasoningBytes      int       `json:"reasoningBytes"`
+	ReasoningDeltaBytes int       `json:"reasoningDeltaBytes"`
+	EncryptedBytes      int       `json:"encryptedBytes"`
+	OutputTokens        int64     `json:"outputTokens"`
+	ReasoningTokens     int64     `json:"reasoningTokens"`
+	VisibleChars        int       `json:"visibleChars"`
+	FirstTokenMS        int64     `json:"firstTokenMs"`
+	DurationMS          int64     `json:"durationMs"`
+	OutputTPS           float64   `json:"outputTps"`
+	EgressNodeID        uint64    `json:"egressNodeId"`
+	EgressNodeName      string    `json:"egressNodeName"`
+	EarlyStop           bool      `json:"earlyStop"`
+	Model               string    `json:"model"`
+	Error               string    `json:"error,omitempty"`
+	Penalized           bool      `json:"penalized"`
+	ProbedAt            time.Time `json:"probedAt"`
 }
 
 // RunView reports one batch (manual or automatic) execution.
@@ -650,6 +654,7 @@ func (s *Service) probeOne(ctx context.Context, runID string, cfg Config, accoun
 			AccountID: result.AccountID, AccountName: result.AccountName, Email: result.Email,
 			Verdict: result.Verdict, Reason: result.Reason, StatusCode: result.StatusCode,
 			HasThinking: result.HasThinking, ReasoningBytes: result.ReasoningBytes,
+			ReasoningDeltaBytes: result.ReasoningDeltaBytes, EncryptedBytes: result.EncryptedBytes,
 			OutputTokens: result.OutputTokens, ReasoningTokens: result.ReasoningTokens,
 			VisibleChars: result.VisibleChars, FirstTokenMS: result.FirstTokenMS,
 			DurationMS: result.DurationMS, OutputTPS: result.OutputTPS,

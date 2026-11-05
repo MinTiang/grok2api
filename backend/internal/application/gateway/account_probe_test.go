@@ -158,3 +158,29 @@ func TestProbeStreamMarkersDecideVerdict(t *testing.T) {
 		t.Fatalf("degraded stream reasoning bytes = %d, want 0 (start stub is not proof)", got)
 	}
 }
+
+// TestThinkingEvidenceRequiresPlaintextOrFloor pins how the two reasoning traces
+// combine. A degraded account can still attach a short encrypted signature, so a
+// non-zero encrypted length alone must not count as thinking.
+func TestThinkingEvidenceRequiresPlaintextOrFloor(t *testing.T) {
+	cases := []struct {
+		name           string
+		deltaBytes     int
+		encryptedBytes int
+		wantThinking   bool
+	}{
+		{"plaintext delta alone is conclusive", 40, 0, true},
+		{"large encrypted payload counts", 0, 4096, true},
+		{"encrypted at the floor counts", 0, accountProbeMinEncryptedBytes, true},
+		{"short encrypted signature does not", 0, 120, false},
+		{"start stub with nothing else does not", 0, 0, false},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			hasThinking := testCase.deltaBytes > 0 || testCase.encryptedBytes >= accountProbeMinEncryptedBytes
+			if hasThinking != testCase.wantThinking {
+				t.Fatalf("hasThinking = %v, want %v", hasThinking, testCase.wantThinking)
+			}
+		})
+	}
+}

@@ -43,6 +43,10 @@ export type AccountProbeResult = {
   statusCode: number;
   hasThinking: boolean;
   reasoningBytes: number;
+  /** Plaintext reasoning delta bytes; conclusive proof of thinking. */
+  reasoningDeltaBytes: number;
+  /** Encrypted-reasoning payload length; only counts above the server floor. */
+  encryptedBytes: number;
   outputTokens: number;
   reasoningTokens: number;
   visibleChars: number;
@@ -90,6 +94,8 @@ const resultShape = hasShape({
   statusCode: isNumber,
   hasThinking: isBoolean,
   reasoningBytes: isNumber,
+  reasoningDeltaBytes: isNumber,
+  encryptedBytes: isNumber,
   outputTokens: isNumber,
   reasoningTokens: isNumber,
   visibleChars: isNumber,
