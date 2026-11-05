@@ -49,8 +49,24 @@ func convertChatRequestWithReasoningReplay(body []byte, model string, cache *Rea
 		}
 		target["text"] = mustJSON(map[string]json.RawMessage{"format": format})
 	}
+	// A caller may pin the reasoning summary granularity and the effort together.
+	// This is honoured only as a request: measured against grok-4.7 Build, asking
+	// for a detailed summary still returns encrypted reasoning alone, with no
+	// readable delta, so it does not make thinking visible on its own.
+	var reasoning map[string]json.RawMessage
+	if raw := source["reasoning"]; !isEmptyJSON(raw) {
+		if err := json.Unmarshal(raw, &reasoning); err != nil {
+			return nil, ResponseOptions{}, errors.New("reasoning 必须是对象")
+		}
+	}
 	if raw := source["reasoning_effort"]; !isEmptyJSON(raw) {
-		target["reasoning"] = mustJSON(map[string]json.RawMessage{"effort": raw})
+		if reasoning == nil {
+			reasoning = make(map[string]json.RawMessage)
+		}
+		reasoning["effort"] = raw
+	}
+	if len(reasoning) > 0 {
+		target["reasoning"] = mustJSON(reasoning)
 	}
 	var tools []any
 	if raw := source["tools"]; !isEmptyJSON(raw) {
