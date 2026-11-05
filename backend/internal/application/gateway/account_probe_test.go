@@ -222,3 +222,35 @@ func TestEncryptionFloorCalibration(t *testing.T) {
 		})
 	}
 }
+
+// TestEmptySuccessReplyIsDegraded pins the fix for the accounts that survived
+// every sweep. Real traffic showed a 42% rate of 2xx responses carrying no tokens
+// at all; classifying those as transport noise meant the worst accounts were the
+// only ones never penalized.
+func TestEmptySuccessReplyIsDegraded(t *testing.T) {
+	cases := []struct {
+		name       string
+		statusCode int
+		want       string
+	}{
+		{"200 with nothing in it", 200, AccountProbeHard},
+		{"206 with nothing in it", 206, AccountProbeHard},
+		{"500 with nothing in it", 500, AccountProbeError},
+		{"502 with nothing in it", 502, AccountProbeError},
+	}
+	for _, testCase := range cases {
+		t.Run(testCase.name, func(t *testing.T) {
+			result := AccountProbeResult{StatusCode: testCase.statusCode, VisibleChars: 0, OutputTokens: 0}
+			got, reason := classifyAccountProbeResult(result)
+			if got != testCase.want {
+				t.Fatalf("verdict = %q (%s), want %q", got, reason, testCase.want)
+			}
+		})
+	}
+
+	// A reply with visible text but no reasoning is still the original case.
+	result := AccountProbeResult{StatusCode: 200, VisibleChars: 40, OutputTokens: 48}
+	if got, _ := classifyAccountProbeResult(result); got != AccountProbeHard {
+		t.Fatalf("prose without reasoning = %q, want %q", got, AccountProbeHard)
+	}
+}

@@ -777,7 +777,11 @@ func (s *Service) sampleThinkingMode(ctx context.Context, input ProbeInput, acco
 	switch {
 	case degraded >= accountProbeThinkingMajority:
 		best.Verdict = VerdictHard
-		best.Reason = "thinking_missing"
+		// Keep a more specific reason when the sample carried one: an empty reply
+		// and prose-without-reasoning are different failures to an operator.
+		if best.Reason != "empty_reply" {
+			best.Reason = "thinking_missing"
+		}
 		best.HasThinking = false
 	case healthy >= accountProbeThinkingMajority:
 		best.Verdict = VerdictHealthy

@@ -511,6 +511,14 @@ func classifyAccountProbeResult(result AccountProbeResult) (string, string) {
 		return AccountProbeHealthy, "thinking_present"
 	}
 	if result.VisibleChars == 0 && result.OutputTokens == 0 {
+		// A 2xx carrying nothing at all is the headline symptom: the account
+		// accepted the request, spent seconds on it, and streamed no tokens. Real
+		// traffic shows this at a 42% rate on the affected keys, with the request
+		// reporting success. Classifying it as transport noise left exactly the
+		// broken accounts unpenalized, which is why they survived every sweep.
+		if result.StatusCode >= http.StatusOK && result.StatusCode < http.StatusMultipleChoices {
+			return AccountProbeHard, "empty_reply"
+		}
 		return AccountProbeError, "empty_reply"
 	}
 	return AccountProbeHard, "thinking_missing"

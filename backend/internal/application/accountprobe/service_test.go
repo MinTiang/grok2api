@@ -25,6 +25,21 @@ func (f *fakeLister) ListProbeCandidates(_ context.Context, page, _ int) ([]acco
 	return f.byPage[page], f.total, nil
 }
 
+// blockingProber holds every probe until released, so a started run stays
+// running instead of finishing before a second Start can observe the flag. The
+// concurrent-start test was flaky without it.
+type blockingProber struct {
+	release chan struct{}
+}
+
+func (p *blockingProber) ProbeAccount(ctx context.Context, _ ProbeInput) (ProbeResult, error) {
+	select {
+	case <-p.release:
+	case <-ctx.Done():
+	}
+	return ProbeResult{Verdict: VerdictHealthy, ReasoningRatio: 5}, nil
+}
+
 // TestCursorAdvancesAcrossCycles is the regression guard for the original bug:
 // automatic cycles used to request page 1 forever, so an account pool larger
 // than one chunk was only ever probed at the front.
@@ -78,8 +93,11 @@ func TestCursorDoesNotAdvanceWhenBatchRejected(t *testing.T) {
 			3: {{ID: 30}},
 		},
 	}
-	service := NewService(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, lister)
+	// Hold the probe so the run stays active while both Start calls race.
+	release := make(chan struct{})
+	service := NewService(slog.New(slog.NewTextHandler(io.Discard, nil)), &blockingProber{release: release}, nil, lister)
 	service.UpdateConfig(Config{Enabled: true, ClientKeyID: 1, ChunkSize: 1})
+	defer close(release)
 
 	// Occupy the service so the next Start is rejected.
 	if _, err := service.Start(context.Background(), "manual", []uint64{1}); err != nil {
@@ -99,8 +117,11 @@ func TestCursorDoesNotAdvanceWhenBatchRejected(t *testing.T) {
 // arriving together must not both launch a run.
 func TestStartRejectsConcurrentBatch(t *testing.T) {
 	lister := &fakeLister{}
-	service := NewService(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, lister)
+	// Hold the probe so the run stays active while both Start calls race.
+	release := make(chan struct{})
+	service := NewService(slog.New(slog.NewTextHandler(io.Discard, nil)), &blockingProber{release: release}, nil, lister)
 	service.UpdateConfig(Config{Enabled: true, ClientKeyID: 1, ChunkSize: 1})
+	defer close(release)
 
 	var wg sync.WaitGroup
 	started := make(chan struct{}, 2)
