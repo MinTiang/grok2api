@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/chenyme/grok2api/backend/internal/domain/audit"
+	"github.com/chenyme/grok2api/backend/internal/domain/clientkey"
 	infraegress "github.com/chenyme/grok2api/backend/internal/infra/egress"
 	"github.com/chenyme/grok2api/backend/internal/infra/security"
 )
@@ -169,11 +170,12 @@ func (s *Service) ProbeAccount(ctx context.Context, input AccountProbeInput) (Ac
 		"max_tokens":     maxOutput,
 	}
 	if mode == AccountProbeModeTool {
-		// "required" is what makes the test meaningful: with "auto" a degraded
-		// account answers in prose and a healthy one may also skip the call, so
-		// only a forced call separates capability from choice.
+		// "auto" is what makes the test meaningful. The capability being measured
+		// is whether the account reaches for a tool at all when the task needs one;
+		// forcing the call with "required" hides that, and measured upstream it also
+		// honours the forced variant only about half the time.
 		payload["tools"] = accountProbeTools()
-		payload["tool_choice"] = "required"
+		payload["tool_choice"] = "auto"
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -257,7 +259,31 @@ func (s *Service) ProbeAccount(ctx context.Context, input AccountProbeInput) (Ac
 			result.Error = readErr.Error()
 			return result, nil
 		}
-		return parseAccountProbeToolBody(result, payload), nil
+		parsed, call := parseAccountProbeToolBody(result, payload)
+		// A call on its own does not prove the account can use tools: measured on
+		// this fleet almost every account emits one. What separates them is whether
+		// the account can carry the tool result forward, so the grounded follow-up
+		// decides the verdict.
+		if parsed.ToolCallOK && call != nil {
+			grounded, followErr, followTokens := s.probeToolFollowUp(probeCtx, key, publicModel, input.Model, prompt, *call, input.AccountID, maxOutput)
+			parsed.OutputTokens += followTokens
+			switch {
+			case followErr != nil:
+				parsed.Verdict = AccountProbeError
+				parsed.Reason = "follow_up_failed"
+				parsed.Error = followErr.Error()
+				parsed.ToolCallOK = false
+			case grounded:
+				parsed.Verdict = AccountProbeHealthy
+				parsed.Reason = "tool_call_ok"
+			default:
+				parsed.Verdict = AccountProbeHard
+				parsed.Reason = "tool_call_ungrounded"
+				parsed.ToolCallOK = false
+			}
+		}
+		parsed.DurationMS = time.Since(startedAt).Milliseconds()
+		return parsed, nil
 	}
 
 	var firstGeneratedAt time.Time
@@ -528,39 +554,71 @@ const (
 	// only verdict signal available while the stream is still open, so the probe
 	// can decide and stop instead of paying for the whole reply.
 	accountProbeThinkingThreshold = 3 * time.Second
-	// accountProbeToolName is the single function the tool-mode probe asks for.
-	accountProbeToolName = "get_weather"
-	// accountProbeToolPrompt names the expected arguments so the probe can check
-	// the call itself, not merely that some call happened.
-	accountProbeToolPrompt = "What is the weather in Tokyo right now? Call the get_weather tool with city=Tokyo and unit=celsius."
+	// accountProbeToolName is the function the tool-mode probe requires. The wrong
+	// tools below are deliberately plausible, so reaching for the right one is a
+	// real decision rather than the only option.
+	accountProbeToolName = "get_stock_price"
+	// accountProbeToolArg is the argument that must carry the subject of the task.
+	accountProbeToolArg = "ticker"
+	// accountProbeToolPrompt needs live data and names no tool. A degraded account
+	// answers from memory or picks an unrelated tool, which is exactly what the
+	// client-side symptom looks like.
+	accountProbeToolPrompt = "What is the current share price of AAPL in USD? I need the real market price, so call a tool instead of guessing."
+	// accountProbeToolFakePrice is the number the probe injects as the tool result.
+	// A grounded answer can only quote it back, so its presence proves the account
+	// carried the tool output forward instead of answering from memory.
+	accountProbeToolFakePrice     = "187.42"
+	accountProbeToolResultContent = "AAPL is trading at 187.42 USD right now."
 )
 
-// accountProbeTools is the tool schema the tool-mode probe offers. It is fixed so
-// every account is asked the same question and the calls are comparable.
+// accountProbeTools is the tool schema the tool-mode probe offers.
+//
+// Four tools with similar shapes are offered on purpose. Measuring a single toy
+// tool made every account look healthy: 29 of 30 called it correctly, so the test
+// had no discriminating power. Forcing a choice between near-miss candidates is
+// what turns this into a capability test.
 func accountProbeTools() []map[string]any {
-	return []map[string]any{{
-		"type": "function",
-		"function": map[string]any{
-			"name":        accountProbeToolName,
-			"description": "Get the current weather for a city",
-			"parameters": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"city": map[string]any{"type": "string", "description": "City name"},
-					"unit": map[string]any{
-						"type": "string",
-						"enum": []string{"celsius", "fahrenheit"},
-					},
+	tool := func(name, description string, properties map[string]any, required ...string) map[string]any {
+		return map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":        name,
+				"description": description,
+				"parameters": map[string]any{
+					"type":       "object",
+					"properties": properties,
+					"required":   required,
 				},
-				"required": []string{"city", "unit"},
 			},
-		},
-	}}
+		}
+	}
+	return []map[string]any{
+		tool(accountProbeToolName, "Get the current market price of a stock",
+			map[string]any{
+				accountProbeToolArg: map[string]any{"type": "string", "description": "Stock ticker symbol, for example AAPL"},
+				"currency":          map[string]any{"type": "string", "enum": []string{"USD", "EUR", "JPY"}},
+			}, accountProbeToolArg, "currency"),
+		tool("get_weather", "Get the current weather for a city",
+			map[string]any{
+				"city": map[string]any{"type": "string"},
+				"unit": map[string]any{"type": "string", "enum": []string{"celsius", "fahrenheit"}},
+			}, "city"),
+		tool("search_web", "Search the web for a page matching a query",
+			map[string]any{
+				"query": map[string]any{"type": "string"},
+			}, "query"),
+		tool("send_email", "Send an email to a recipient",
+			map[string]any{
+				"to":      map[string]any{"type": "string"},
+				"subject": map[string]any{"type": "string"},
+			}, "to", "subject"),
+	}
 }
 
-// accountProbeToolCallComplete reports whether the model actually invoked the
-// probe tool with both required arguments. A prose answer, or a call whose
-// arguments are missing or malformed, is what a degraded account produces.
+// accountProbeToolCallComplete reports whether the model reached for the right
+// tool and passed the task subject through. Choosing a plausible but wrong tool,
+// omitting the argument, or answering in prose all count as a miss: they are the
+// same failure a real client sees when an account cannot drive tools.
 func accountProbeToolCallComplete(name, args string) bool {
 	if name != accountProbeToolName {
 		return false
@@ -569,15 +627,102 @@ func accountProbeToolCallComplete(name, args string) bool {
 	if json.Unmarshal([]byte(args), &parsed) != nil {
 		return false
 	}
-	city, hasCity := parsed["city"].(string)
-	unit, hasUnit := parsed["unit"].(string)
-	return hasCity && hasUnit && strings.TrimSpace(city) != "" && strings.TrimSpace(unit) != ""
+	ticker, ok := parsed[accountProbeToolArg].(string)
+	if !ok || strings.TrimSpace(ticker) == "" {
+		return false
+	}
+	// The subject has to survive into the argument, otherwise the call did not
+	// actually carry the task.
+	return strings.Contains(strings.ToUpper(ticker), "AAPL")
+}
+
+// probeToolFollowUp completes the tool loop and reports whether the final answer
+// is grounded in the result the probe injected.
+//
+// This is the step that actually separates accounts here. Emitting a tool call is
+// something nearly every account manages - 29 of 30 did, and adding near-miss
+// candidate tools did not change that. Carrying the returned value into the answer
+// is the part a degraded account skips, and it is the same failure a client sees
+// when tools "do not work".
+func (s *Service) probeToolFollowUp(ctx context.Context, key clientkey.Key, publicModel, model, prompt string, call qualityProbeToolCall, accountID uint64, maxOutput int) (bool, error, int64) {
+	body, err := json.Marshal(map[string]any{
+		"model":      model,
+		"stream":     false,
+		"max_tokens": maxOutput,
+		"tools":      accountProbeTools(),
+		"messages": []any{
+			map[string]any{"role": "user", "content": prompt},
+			map[string]any{
+				"role":    "assistant",
+				"content": "",
+				"tool_calls": []any{map[string]any{
+					"id":   call.ID,
+					"type": "function",
+					"function": map[string]any{
+						"name":      call.Function.Name,
+						"arguments": call.Function.Arguments,
+					},
+				}},
+			},
+			map[string]any{
+				"role":         "tool",
+				"tool_call_id": call.ID,
+				"content":      accountProbeToolResultContent,
+			},
+		},
+	})
+	if err != nil {
+		return false, err, 0
+	}
+	requestIDPart, err := security.NewOpaqueToken(12)
+	if err != nil {
+		return false, err, 0
+	}
+	answer, err := s.CreateChatCompletion(ctx, Input{
+		RequestID: "probe_follow_" + requestIDPart, ClientKey: key, PublicModel: publicModel,
+		Body: body, Streaming: false, Operation: audit.OperationChat,
+		ForcedAccountID: accountID, accountProbe: true,
+	})
+	if err != nil {
+		return false, err, 0
+	}
+	defer answer.Body.Close()
+	payload, readErr := io.ReadAll(io.LimitReader(answer.Body, accountProbeMaxStreamBytes))
+	if readErr != nil {
+		return false, readErr, 0
+	}
+	if answer.StatusCode < http.StatusOK || answer.StatusCode >= http.StatusMultipleChoices {
+		return false, fmt.Errorf("兜底轮上游返回 %d: %s", answer.StatusCode, strings.TrimSpace(string(payload))[:min(len(payload), 200)]), 0
+	}
+	var response struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+		Usage *struct {
+			CompletionTokens int64 `json:"completion_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(payload, &response); err != nil {
+		return false, fmt.Errorf("兜底轮响应解析失败: %w", err), 0
+	}
+	var tokens int64
+	if response.Usage != nil {
+		tokens = response.Usage.CompletionTokens
+	}
+	if len(response.Choices) == 0 {
+		return false, errors.New("兜底轮没有返回内容"), tokens
+	}
+	// The injected number is the only place 187.42 can come from, so quoting it
+	// proves the tool output reached the answer.
+	return strings.Contains(response.Choices[0].Message.Content, accountProbeToolFakePrice), nil, tokens
 }
 
 // parseAccountProbeToolBody turns a complete Chat Completions response into a
 // tool-mode verdict. Arguments are concatenated per index because the wire format
-// splits them, and completeness is what separates a real call from prose.
-func parseAccountProbeToolBody(result AccountProbeResult, payload []byte) AccountProbeResult {
+// splits them. The first call is returned so the caller can continue the loop.
+func parseAccountProbeToolBody(result AccountProbeResult, payload []byte) (AccountProbeResult, *qualityProbeToolCall) {
 	result.Mode = AccountProbeModeTool
 	var response struct {
 		Choices []struct {
@@ -593,17 +738,37 @@ func parseAccountProbeToolBody(result AccountProbeResult, payload []byte) Accoun
 				ReasoningTokens int64 `json:"reasoning_tokens"`
 			} `json:"completion_tokens_details"`
 		} `json:"usage"`
+		Error *struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Code    string `json:"code"`
+		} `json:"error"`
 	}
 	if err := json.Unmarshal(payload, &response); err != nil {
 		result.Verdict = AccountProbeError
 		result.Reason = "invalid_response"
 		result.Error = "短测响应不是合法 JSON"
-		return result
+		return result, nil
 	}
 	if len(response.Choices) == 0 {
+		// An error envelope is not a capability signal. Without this the empty
+		// choices list was read as "no tool call" and a 403 became a degraded
+		// verdict that penalized the account.
 		result.Verdict = AccountProbeError
 		result.Reason = "empty_reply"
-		return result
+		if response.Error != nil {
+			result.Error = strings.TrimSpace(response.Error.Message)
+			if code := strings.TrimSpace(response.Error.Code); code != "" {
+				if result.Error == "" {
+					result.Error = code
+				} else {
+					result.Error = code + ": " + result.Error
+				}
+			}
+			result.Verdict = classifyAccountProbeFailure(0, result.Error)
+			result.Reason = probeReasonForStatus(result.Verdict, 0)
+		}
+		return result, nil
 	}
 	choice := response.Choices[0]
 	var name string
@@ -630,13 +795,26 @@ func parseAccountProbeToolBody(result AccountProbeResult, payload []byte) Accoun
 		result.Verdict = AccountProbeError
 		result.Reason = "empty_reply"
 	case name == "":
+		// Answered without reaching for any tool: the headline symptom.
 		result.Verdict = AccountProbeHard
 		result.Reason = "tool_call_missing"
+	case name != accountProbeToolName:
+		// Picked a plausible but wrong tool.
+		result.Verdict = AccountProbeHard
+		result.Reason = "tool_call_wrong"
 	default:
+		// Right tool, but the task subject did not survive into the arguments.
 		result.Verdict = AccountProbeHard
 		result.Reason = "tool_call_incomplete"
 	}
-	return result
+	if !result.ToolCallOK || len(choice.Message.ToolCalls) == 0 {
+		return result, nil
+	}
+	first := choice.Message.ToolCalls[0]
+	if first.ID == "" {
+		first.ID = "call_probe"
+	}
+	return result, &first
 }
 
 // normalizeAccountProbeMode keeps an unknown or empty mode on the tool default.

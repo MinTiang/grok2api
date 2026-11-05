@@ -677,7 +677,8 @@ func (s *Service) execute(ctx context.Context, runID string, cfg Config, account
 // short requests, and the loop stops as soon as the outcome is settled.
 func (s *Service) sampleToolMode(ctx context.Context, input ProbeInput, accountID uint64) ProbeResult {
 	var best ProbeResult
-	okCount, decided := 0, 0
+	var lastError ProbeResult
+	okCount, responded := 0, 0
 	for sample := 0; sample < accountProbeToolSamples; sample++ {
 		if sample > 0 {
 			select {
@@ -696,37 +697,53 @@ func (s *Service) sampleToolMode(ctx context.Context, input ProbeInput, accountI
 		if result.Reason == "account_disabled" {
 			return result
 		}
-		decided++
+		// A failed request says nothing about tool capability. Counting it as a
+		// missing call is what made an upstream 403 look like a degraded account.
+		if result.Verdict == VerdictError {
+			lastError = result
+			continue
+		}
+		responded++
 		if result.ToolCallOK {
 			okCount++
 			// Keep a successful sample: it carries the arguments worth showing.
 			if !best.ToolCallOK {
 				best = result
 			}
-		} else if best.Verdict == "" {
+		} else if best.Verdict == "" || best.Verdict == VerdictHealthy {
+			// Keep the first genuine failure so the verdict can name the mode.
 			best = result
 		}
 		if okCount >= accountProbeToolMajority {
 			break
 		}
 		// Stop once the majority is arithmetically impossible.
-		if decided-okCount > accountProbeToolSamples-accountProbeToolMajority {
+		if responded-okCount > accountProbeToolSamples-accountProbeToolMajority {
 			break
 		}
 	}
 	switch {
-	case best.Verdict == "":
-		return ProbeResult{AccountID: accountID, Verdict: VerdictError, Reason: "probe_failed", Error: "多次采样均未拿到响应"}
 	case okCount >= accountProbeToolMajority:
 		best.Verdict = VerdictHealthy
 		best.Reason = "tool_call_ok"
 		best.ToolCallOK = true
-	default:
+	case responded > 0:
+		// The account answered but never completed the tool loop. Keep the specific
+		// failure from the samples instead of flattening every case to "missing":
+		// wrong tool, ungrounded answer and incomplete arguments need different
+		// responses from an operator.
 		best.Verdict = VerdictHard
-		best.Reason = "tool_call_missing"
+		if best.Reason == "" || best.Reason == "tool_call_ok" {
+			best.Reason = "tool_call_missing"
+		}
 		best.ToolCallOK = false
+	case lastError.Verdict != "":
+		// Every attempt failed at the transport level; keep that verdict and error.
+		return lastError
+	default:
+		return ProbeResult{AccountID: accountID, Verdict: VerdictError, Reason: "probe_failed", Error: "多次采样均未拿到响应"}
 	}
-	s.logger.Info("account_probe_sampled", "account_id", accountID, "ok", okCount, "decided", decided, "verdict", best.Verdict)
+	s.logger.Info("account_probe_sampled", "account_id", accountID, "ok", okCount, "responded", responded, "verdict", best.Verdict)
 	return best
 }
 
