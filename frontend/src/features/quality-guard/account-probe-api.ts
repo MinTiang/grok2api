@@ -1,0 +1,151 @@
+import { apiRequest } from "@/shared/api/client";
+import { createObjectDecoder, isArrayOf, isBoolean, isNumber, isOptional, isOneOf, isString } from "@/shared/api/decoder";
+
+export const accountProbePath = "/api/admin/v1/account-probe";
+
+export type AccountProbeVerdict = "healthy" | "hard" | "risk" | "error";
+
+export type AccountProbeConfig = {
+  enabled: boolean;
+  intervalHours: number;
+  chunkSize: number;
+  workers: number;
+  model: string;
+  prompt: string;
+  maxOutputTokens: number;
+  /** Read-only: the server funds probes from its own managed identity. */
+  clientKeyId: number;
+  earlyStopOnThinking: boolean;
+  earlyStopDelayMs: number;
+  cooldownHours: number;
+  autoDisable: boolean;
+};
+
+/** Panel-editable subset; clientKeyId is server-managed and never sent back. */
+export type AccountProbeEditableConfig = Omit<AccountProbeConfig, "clientKeyId">;
+
+export type AccountProbeResult = {
+  accountId: number;
+  accountName: string;
+  email: string;
+  verdict: AccountProbeVerdict;
+  reason: string;
+  statusCode: number;
+  hasThinking: boolean;
+  reasoningBytes: number;
+  outputTokens: number;
+  reasoningTokens: number;
+  visibleChars: number;
+  firstTokenMs: number;
+  durationMs: number;
+  outputTps: number;
+  egressNodeId: number;
+  egressNodeName: string;
+  earlyStop: boolean;
+  model: string;
+  error?: string;
+  penalized: boolean;
+  probedAt: string;
+};
+
+export type AccountProbeRun = {
+  id: string;
+  trigger: string;
+  startedAt: string;
+  finishedAt?: string;
+  total: number;
+  done: number;
+  healthy: number;
+  hard: number;
+  risk: number;
+  errors: number;
+  penalized: number;
+  running: boolean;
+  lastError?: string;
+  results: AccountProbeResult[];
+};
+
+export type AccountProbeStatus = {
+  config: AccountProbeConfig;
+  recent: AccountProbeResult[];
+  runs: AccountProbeRun[];
+};
+
+const configDecoder = createObjectDecoder<AccountProbeConfig>("accountProbeConfig", {
+  enabled: isBoolean,
+  intervalHours: isNumber,
+  chunkSize: isNumber,
+  workers: isNumber,
+  model: isString,
+  prompt: isString,
+  maxOutputTokens: isNumber,
+  clientKeyId: isNumber,
+  earlyStopOnThinking: isBoolean,
+  earlyStopDelayMs: isNumber,
+  cooldownHours: isNumber,
+  autoDisable: isBoolean,
+});
+
+const resultDecoder = createObjectDecoder<AccountProbeResult>("accountProbeResult", {
+  accountId: isNumber,
+  accountName: isString,
+  email: isString,
+  verdict: isOneOf("healthy", "hard", "risk", "error"),
+  reason: isString,
+  statusCode: isNumber,
+  hasThinking: isBoolean,
+  reasoningBytes: isNumber,
+  outputTokens: isNumber,
+  reasoningTokens: isNumber,
+  visibleChars: isNumber,
+  firstTokenMs: isNumber,
+  durationMs: isNumber,
+  outputTps: isNumber,
+  egressNodeId: isNumber,
+  egressNodeName: isString,
+  earlyStop: isBoolean,
+  model: isString,
+  error: isOptional(isString),
+  penalized: isBoolean,
+  probedAt: isString,
+});
+
+const runDecoder = createObjectDecoder<AccountProbeRun>("accountProbeRun", {
+  id: isString,
+  trigger: isString,
+  startedAt: isString,
+  finishedAt: isOptional(isString),
+  total: isNumber,
+  done: isNumber,
+  healthy: isNumber,
+  hard: isNumber,
+  risk: isNumber,
+  errors: isNumber,
+  penalized: isNumber,
+  running: isBoolean,
+  lastError: isOptional(isString),
+  results: isArrayOf(resultDecoder),
+});
+
+const statusDecoder = createObjectDecoder<AccountProbeStatus>("accountProbeStatus", {
+  config: configDecoder,
+  recent: isArrayOf(resultDecoder),
+  runs: isArrayOf(runDecoder),
+});
+
+export async function fetchAccountProbeStatus(): Promise<AccountProbeStatus> {
+  return apiRequest(accountProbePath, { method: "GET" }, statusDecoder);
+}
+
+export async function updateAccountProbeConfig(input: AccountProbeEditableConfig): Promise<void> {
+  await apiRequest(`${accountProbePath}/config`, { method: "PUT", body: input }, createObjectDecoder<{ ok: boolean }>("accountProbeSave", { ok: isBoolean }));
+}
+
+export async function runAccountProbe(accountIds: number[]): Promise<AccountProbeRun> {
+  return apiRequest(`${accountProbePath}/run`, { method: "POST", body: { accountIds } }, runDecoder);
+}
+
+export async function stopAccountProbe(): Promise<boolean> {
+  const data = await apiRequest(`${accountProbePath}/stop`, { method: "POST" }, createObjectDecoder<{ stopped: boolean }>("accountProbeStop", { stopped: isBoolean }));
+  return data.stopped;
+}

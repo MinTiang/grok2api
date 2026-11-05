@@ -123,6 +123,27 @@ audit:
   ledgerUnhealthyGrace: 10s
   ledgerQueueHighWatermarkPercent: 90
 
+# [按需启用] Grok Build 账号短测。主动向单个 Build 账号发一道短题，
+# 见到 reasoning 立刻掐流：有思考记为正常，整段回复没有任何思考记为降智。
+# 降智账号按 qualityGuard.requestRetry 相同口径处置（冷却 + 二次命中禁用），
+# 因此这里只需要配置节奏，不需要再配 Client Key（复用内置探测身份）。
+accountProbe:
+  enabled: false
+  # 后台自动轮测间隔；每轮按 chunkSize 抽样，避免一次性测完整个池子。
+  interval: 6h
+  chunkSize: 50
+  # 并发压低一点：短测本身就是在避免被判定成机器人流量。
+  workers: 2
+  model: "grok-4.6"
+  prompt: ""
+  maxOutputTokens: 48
+  # 见到 thinking 即停，这是省额度的关键；healthy 号只花几十个 token。
+  earlyStopOnThinking: true
+  earlyStopDelay: 800ms
+  # 判定降智后的处置。
+  cooldown: 12h
+  autoDisable: false
+
 # [按需启用] Grok Build 出口质量守护。仅配置后仍不会自动启动 sidecar；
 # 使用 docker compose --profile quality-guard up -d --build 启动。
 qualityGuard:

@@ -19,6 +19,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { Switch } from "@/components/ui/switch";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { AccountProbePanel } from "@/features/quality-guard/account-probe-panel";
 import { DegradeAccountsPanel } from "@/features/quality-guard/degrade-accounts-panel";
 import { ProbeProfilesPanel } from "@/features/quality-guard/probe-profiles-panel";
 import { getQualityGuardStatus, runQualityTest, updateQualityGuardPolicy, type QualityGuardEvent, type QualityGuardNodeState, type QualityGuardPolicy, type QualityGuardStatistics, type QualityGuardStatus, type QualityTestResult } from "@/features/quality-guard/quality-guard-api";
@@ -32,7 +33,7 @@ import { cn } from "@/shared/lib/cn";
 
 const NODE_ACTION_TOAST_ID = "quality-guard-node-action";
 const QUALITY_GUARD_PAGE_SIZES = [20, 50, 100] as const;
-type QualityGuardTab = "nodes" | "profiles" | "accounts";
+type QualityGuardTab = "nodes" | "profiles" | "accounts" | "probe";
 
 export function QualityGuardPage() {
   const { t, i18n } = useTranslation();
@@ -233,7 +234,11 @@ export function QualityGuardPage() {
           <TabsTrigger value="nodes">{t("qualityGuard.nodesTab")}</TabsTrigger>
           <TabsTrigger value="profiles">{t("qualityGuard.profilesTab")}</TabsTrigger>
           <TabsTrigger value="accounts">{t("qualityGuard.degrade.tab")}</TabsTrigger>
+          <TabsTrigger value="probe">{t("accountProbe.tab", "账号短测")}</TabsTrigger>
         </TabsList>
+        <TabsContent value="probe" className="mt-6">
+          <AccountProbePanel />
+        </TabsContent>
         <TabsContent value="profiles" className="mt-6">
           <ProbeProfilesPanel />
         </TabsContent>

@@ -9,6 +9,7 @@ import (
 	_ "github.com/chenyme/grok2api/backend/docs"
 	accountapp "github.com/chenyme/grok2api/backend/internal/application/account"
 	accountsyncapp "github.com/chenyme/grok2api/backend/internal/application/accountsync"
+	accountprobeapp "github.com/chenyme/grok2api/backend/internal/application/accountprobe"
 	adminauthapp "github.com/chenyme/grok2api/backend/internal/application/adminauth"
 	auditapp "github.com/chenyme/grok2api/backend/internal/application/audit"
 	clientkeyapp "github.com/chenyme/grok2api/backend/internal/application/clientkey"
@@ -20,6 +21,7 @@ import (
 	settingsapp "github.com/chenyme/grok2api/backend/internal/application/settings"
 	updatecheckapp "github.com/chenyme/grok2api/backend/internal/application/updatecheck"
 	accounthttp "github.com/chenyme/grok2api/backend/internal/transport/http/account"
+	accountprobehttp "github.com/chenyme/grok2api/backend/internal/transport/http/accountprobe"
 	adminauthhttp "github.com/chenyme/grok2api/backend/internal/transport/http/adminauth"
 	audithttp "github.com/chenyme/grok2api/backend/internal/transport/http/audit"
 	clientkeyhttp "github.com/chenyme/grok2api/backend/internal/transport/http/clientkey"
@@ -61,6 +63,7 @@ type Dependencies struct {
 	Media                  *mediaapp.Service
 	Settings               *settingsapp.Service
 	Egress                 *egressapp.Service
+	AccountProbe           *accountprobeapp.Service
 	QualityGuardStatePath  string
 	QualityGuardConfigPath string
 	QualityGuardToken      string
@@ -159,6 +162,9 @@ func New(deps Dependencies) *gin.Engine {
 	settingshttp.NewHandler(deps.Settings).Register(adminProtected)
 	egressHandler := egresshttp.NewHandler(deps.Egress, deps.QualityGuardStatePath, deps.QualityGuardConfigPath).WithQualityGuardProbe(deps.QualityGuardProbe)
 	egressHandler.Register(adminProtected)
+	if deps.AccountProbe != nil {
+		accountprobehttp.NewHandler(deps.AccountProbe).Register(adminProtected)
+	}
 	systemhttp.NewHandler(func() string {
 		if deps.Settings != nil {
 			return deps.Settings.PublicAPIBaseURL()

@@ -68,8 +68,40 @@ type Config struct {
 	Routing           RoutingConfig           `yaml:"routing"`
 	Audit             AuditConfig             `yaml:"audit"`
 	QualityGuard      QualityGuardConfig      `yaml:"qualityGuard"`
+	AccountProbe      AccountProbeConfig      `yaml:"accountProbe"`
 	ClientKeyDefaults ClientKeyDefaultsConfig `yaml:"clientKeyDefaults"`
 	Accounts          AccountsConfig          `yaml:"-"`
+}
+
+// AccountProbeConfig drives the Build account short-stream quality probe.
+//
+// It is intentionally separate from QualityGuard: QualityGuard watches egress
+// nodes passively and from the request path, while this probe actively asks one
+// account to think and decides from whether reasoning actually streamed.
+type AccountProbeConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// Interval is the delay between automatic cycles.
+	Interval Duration `yaml:"interval"`
+	// ChunkSize bounds how many accounts one automatic cycle probes, keeping a
+	// large pool from being probed all at once.
+	ChunkSize int `yaml:"chunkSize"`
+	// Workers caps probe concurrency. Keep it low: aggressive probing is itself
+	// the kind of traffic pattern risk control reacts to.
+	Workers     int    `yaml:"workers"`
+	Model       string `yaml:"model"`
+	Prompt      string `yaml:"prompt"`
+	Cooldown    Duration `yaml:"cooldown"`
+	AutoDisable bool   `yaml:"autoDisable"`
+	// MaxOutputTokens caps the reply. The probe stops as soon as reasoning
+	// appears, so this only bounds a degraded account.
+	MaxOutputTokens int `yaml:"maxOutputTokens"`
+	// EarlyStopOnThinking ends the stream once reasoning is observed. Pointer so
+	// that an explicit `false` is distinguishable from "not configured", whose
+	// default is on.
+	EarlyStopOnThinking *bool `yaml:"earlyStopOnThinking"`
+	// EarlyStopDelay is held after reasoning first appears before cutting the
+	// stream, so a partial reasoning chunk is not mistaken for a full thought.
+	EarlyStopDelay Duration `yaml:"earlyStopDelay"`
 }
 
 type ServerConfig struct {

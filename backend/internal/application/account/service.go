@@ -2353,6 +2353,49 @@ func (s *Service) MarkBuildAPIFallback(ctx context.Context, id uint64, enabled b
 	return mapRepositoryError(s.accounts.MarkBuildAPIFallback(ctx, id, enabled))
 }
 
+// ApplyMissingThinkingPenalty cools (or disables) one account after an account
+// quality probe completed without streaming any reasoning.
+//
+// This mirrors Selector.markMissingThinking exactly so the two entry points
+// cannot drift apart: a durable missing_thinking marker is always written, the
+// second strike escalates to disable, and an explicit autoDisable short-circuits
+// to disable on the first miss.
+//
+// The request path additionally calls Selector.evictCandidate to drop its local
+// routing snapshot in the same tick. Here that is left to the
+// InvalidationAccountHealthChanged event UpdateHealth publishes, which the
+// selector subscribes to. The only difference is a sub-millisecond window where a
+// cooled account could still be picked from a stale snapshot, which is why no
+// local eviction is duplicated at this layer.
+func (s *Service) ApplyMissingThinkingPenalty(ctx context.Context, id uint64, cooldown time.Duration, autoDisable bool) error {
+	value, err := s.accounts.Get(ctx, id)
+	if err != nil {
+		return mapRepositoryError(err)
+	}
+	if cooldown <= 0 {
+		cooldown = 12 * time.Hour
+	}
+	now := time.Now().UTC()
+	if s.now != nil {
+		now = s.now().UTC()
+	}
+	inCooldown := value.CooldownUntil != nil && now.Before(*value.CooldownUntil)
+	struck := accountdomain.NormalizeHealthMarker(value.LastError) == accountdomain.LastErrorMissingThinking
+
+	if autoDisable || (struck && !inCooldown) {
+		disabled := false
+		if _, err := s.accounts.UpdateMany(ctx, value.Provider, []uint64{value.ID}, repository.AccountUpdates{Enabled: &disabled}); err != nil {
+			return mapRepositoryError(err)
+		}
+		return mapRepositoryError(s.accounts.UpdateHealth(ctx, value.ID, value.Provider, value.FailureCount, nil, accountdomain.LastErrorMissingThinkingDisabled, false))
+	}
+	if inCooldown {
+		return nil
+	}
+	until := now.Add(cooldown)
+	return mapRepositoryError(s.accounts.UpdateHealth(ctx, value.ID, value.Provider, value.FailureCount, &until, accountdomain.LastErrorMissingThinking, false))
+}
+
 func (s *Service) Delete(ctx context.Context, id uint64) error {
 	// Single-account delete must preserve ErrNotFound when the root row is gone
 	// (BatchDeleteWithLinked/DeleteMany return deleted=0, nil for missing IDs).

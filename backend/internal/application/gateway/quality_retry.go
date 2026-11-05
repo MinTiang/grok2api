@@ -438,7 +438,11 @@ func CommitQualityHold(verdict QualityVerdict, qualityAttempt, maxAttempts int, 
 }
 
 func shouldHoldQualityStream(input Input, ownership *inferencedomain.ResponseOwnership, route modeldomain.Route, operation audit.Operation, cfg QualityRetryRuntime) bool {
-	if !cfg.Enabled || !input.Streaming || input.ForcedEgressNodeID != 0 || input.skipQualityHold {
+	// Internal account probes decide and apply their own penalty from the streamed
+	// reasoning they observe. Letting the request path hold them as well would
+	// double-penalize a degraded account and, worse, could re-hold an account the
+	// probe just deliberately pinned to re-evaluate.
+	if !cfg.Enabled || !input.Streaming || input.ForcedEgressNodeID != 0 || input.skipQualityHold || input.accountProbe {
 		return false
 	}
 	switch operation {

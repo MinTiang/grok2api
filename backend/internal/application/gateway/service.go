@@ -129,6 +129,10 @@ type Input struct {
 	// ForcedAccountID is paired with ForcedEgressNodeID only by the internal
 	// Quality Guard recovery path. It never accepts public request input.
 	ForcedAccountID uint64
+	// accountProbe marks an internal account quality probe. It pins the account
+	// without requiring an egress node binding and lifts the account cooldown,
+	// because probing an already-cooled account is the entire point.
+	accountProbe bool
 }
 
 type Usage struct {
@@ -1130,7 +1134,10 @@ func (s *Service) createResponseAt(ctx context.Context, input Input, path string
 				record.CreatedAt = now
 				applyAuditEgress(&record, egressTrace, route.Provider)
 				if err := budget.run("quality_disable", finalizationHealthBudget, func(stageCtx context.Context) error {
-					return s.applyOutputSpeedPenalty(stageCtx, record, credential, holdCfg, input.ForcedEgressNodeID != 0)
+					// Probes truncate the stream once reasoning appears, which inflates
+					// observed TPS. The probe owns its verdict, so the speed penalty must
+					// stay out of the way here.
+					return s.applyOutputSpeedPenalty(stageCtx, record, credential, holdCfg, input.ForcedEgressNodeID != 0 || input.accountProbe)
 				}); err != nil {
 					s.logger.Error("quality_degraded_penalty_failed", "request_id", input.RequestID, "account_id", credential.ID, "error", err)
 				}
@@ -1221,7 +1228,14 @@ attemptLoop:
 		var lease *accountLease
 		var err error
 		selectionStarted := time.Now()
-		if input.ForcedAccountID != 0 {
+		if input.accountProbe {
+			// Account quality probes pin the account only. The provider request
+			// keeps whatever egress the account itself is bound to, so the probe
+			// observes the same exit the scheduler would use. An account without a
+			// concrete binding falls through to normal pool selection, which is
+			// exactly how it would be reached by real traffic.
+			lease, err = s.selector.AcquirePinnedForAccountProbe(ctx, route.Provider, input.ForcedAccountID, route.ID, route.UpstreamModel, quotaMode, accountScope)
+		} else if input.ForcedAccountID != 0 {
 			if input.ForcedEgressNodeID == 0 {
 				err = &SelectionUnavailableError{Reason: SelectionNoAccounts}
 			} else {
