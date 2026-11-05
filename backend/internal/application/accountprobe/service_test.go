@@ -272,3 +272,45 @@ func TestSamplingNeverTreatsRiskAsHealth(t *testing.T) {
 		t.Fatalf("tool mode verdict = %q, want %q", toolGot.Verdict, VerdictRisk)
 	}
 }
+
+// TestCalibrationIgnoresStaleSamples guards the rolling ring: recent results
+// outlive configuration changes, so a calibration that counted every row would
+// report a gap computed across two different prompts or thresholds.
+func TestCalibrationIgnoresStaleSamples(t *testing.T) {
+	current := accountProbePromptFingerprint("17 times 23")
+	stale := accountProbePromptFingerprint("clock at 3:27")
+
+	s := &Service{cfg: normalizeConfig(Config{RatioThreshold: 3.8, Prompt: "17 times 23"})}
+	add := func(prompt string, threshold, ratio float64) {
+		s.recent = append(s.recent, ResultView{
+			Verdict: VerdictHealthy, ReasoningRatio: ratio,
+			ProbePrompt: prompt, ProbeThreshold: threshold,
+		})
+	}
+	// Three current rows per band: enough to calibrate.
+	add(current, 3.8, 2.1)
+	add(current, 3.8, 2.3)
+	add(current, 3.8, 2.5)
+	add(current, 3.8, 5.1)
+	add(current, 3.8, 5.3)
+	add(current, 3.8, 5.5)
+	// Leftovers that would drag the healthy floor down to 2.9 if counted.
+	add(stale, 3.0, 2.9)
+	add(stale, 3.0, 2.95)
+	// A row measured under a different threshold does not count either.
+	add(current, 3.0, 3.1)
+
+	got := s.RatioSummary()
+	if got.Samples != 6 {
+		t.Fatalf("samples = %d, want 6 (current config only)", got.Samples)
+	}
+	if got.Ignored != 3 {
+		t.Fatalf("ignored = %d, want 3", got.Ignored)
+	}
+	if got.HealthyMin != 5.1 {
+		t.Fatalf("healthyMin = %v, want 5.1 - a stale row leaked in", got.HealthyMin)
+	}
+	if !got.Calibrated {
+		t.Fatalf("expected calibrated, got warning %q", got.Warning)
+	}
+}

@@ -12,9 +12,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"math"
 	"runtime/debug"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -270,37 +273,43 @@ type Config struct {
 
 // ResultView is one panel-facing probe row.
 type ResultView struct {
-	AccountID           uint64    `json:"accountId"`
-	AccountName         string    `json:"accountName"`
-	Email               string    `json:"email"`
-	Verdict             string    `json:"verdict"`
-	Reason              string    `json:"reason"`
-	StatusCode          int       `json:"statusCode"`
-	HasThinking         bool      `json:"hasThinking"`
-	ReasoningBytes      int       `json:"reasoningBytes"`
-	ReasoningDeltaBytes int       `json:"reasoningDeltaBytes"`
-	EncryptedBytes      int       `json:"encryptedBytes"`
-	EncryptionFloor     int64     `json:"encryptionFloor"`
-	ReasoningRatio      float64   `json:"reasoningRatio"`
-	FirstVisibleMS      int64     `json:"firstVisibleMs"`
-	AnswerExcerpt       string    `json:"answerExcerpt,omitempty"`
-	Mode                string    `json:"mode,omitempty"`
-	ToolCallOK          bool      `json:"toolCallOk"`
-	ToolName            string    `json:"toolName,omitempty"`
-	ToolArgs            string    `json:"toolArgs,omitempty"`
-	OutputTokens        int64     `json:"outputTokens"`
-	ReasoningTokens     int64     `json:"reasoningTokens"`
-	VisibleChars        int       `json:"visibleChars"`
-	FirstTokenMS        int64     `json:"firstTokenMs"`
-	DurationMS          int64     `json:"durationMs"`
-	OutputTPS           float64   `json:"outputTps"`
-	EgressNodeID        uint64    `json:"egressNodeId"`
-	EgressNodeName      string    `json:"egressNodeName"`
-	EarlyStop           bool      `json:"earlyStop"`
-	Model               string    `json:"model"`
-	Error               string    `json:"error,omitempty"`
-	Penalized           bool      `json:"penalized"`
-	ProbedAt            time.Time `json:"probedAt"`
+	AccountID           uint64  `json:"accountId"`
+	AccountName         string  `json:"accountName"`
+	Email               string  `json:"email"`
+	Verdict             string  `json:"verdict"`
+	Reason              string  `json:"reason"`
+	StatusCode          int     `json:"statusCode"`
+	HasThinking         bool    `json:"hasThinking"`
+	ReasoningBytes      int     `json:"reasoningBytes"`
+	ReasoningDeltaBytes int     `json:"reasoningDeltaBytes"`
+	EncryptedBytes      int     `json:"encryptedBytes"`
+	EncryptionFloor     int64   `json:"encryptionFloor"`
+	ReasoningRatio      float64 `json:"reasoningRatio"`
+	// ProbeThreshold and ProbePrompt record the configuration that produced this
+	// row. Recent results are a rolling ring, so without them a calibration would
+	// mix rows measured under an older prompt or threshold and report a gap that
+	// does not exist under the settings actually in force.
+	ProbeThreshold  float64   `json:"probeThreshold,omitempty"`
+	ProbePrompt     string    `json:"probePrompt,omitempty"`
+	FirstVisibleMS  int64     `json:"firstVisibleMs"`
+	AnswerExcerpt   string    `json:"answerExcerpt,omitempty"`
+	Mode            string    `json:"mode,omitempty"`
+	ToolCallOK      bool      `json:"toolCallOk"`
+	ToolName        string    `json:"toolName,omitempty"`
+	ToolArgs        string    `json:"toolArgs,omitempty"`
+	OutputTokens    int64     `json:"outputTokens"`
+	ReasoningTokens int64     `json:"reasoningTokens"`
+	VisibleChars    int       `json:"visibleChars"`
+	FirstTokenMS    int64     `json:"firstTokenMs"`
+	DurationMS      int64     `json:"durationMs"`
+	OutputTPS       float64   `json:"outputTps"`
+	EgressNodeID    uint64    `json:"egressNodeId"`
+	EgressNodeName  string    `json:"egressNodeName"`
+	EarlyStop       bool      `json:"earlyStop"`
+	Model           string    `json:"model"`
+	Error           string    `json:"error,omitempty"`
+	Penalized       bool      `json:"penalized"`
+	ProbedAt        time.Time `json:"probedAt"`
 }
 
 // RunView reports one batch (manual or automatic) execution.
@@ -913,6 +922,7 @@ func (s *Service) probeOne(ctx context.Context, runID string, cfg Config, accoun
 			HasThinking: result.HasThinking, ReasoningBytes: result.ReasoningBytes,
 			ReasoningDeltaBytes: result.ReasoningDeltaBytes, EncryptedBytes: result.EncryptedBytes,
 			EncryptionFloor: result.EncryptionFloor, ReasoningRatio: result.ReasoningRatio,
+			ProbeThreshold: cfg.RatioThreshold, ProbePrompt: accountProbePromptFingerprint(cfg.Prompt),
 			FirstVisibleMS: result.FirstVisibleMS, AnswerExcerpt: result.AnswerExcerpt,
 			Mode: result.Mode, ToolCallOK: result.ToolCallOK,
 			ToolName: result.ToolName, ToolArgs: result.ToolArgs,
@@ -1038,8 +1048,23 @@ type RatioSummary struct {
 	HealthyMin  float64 `json:"healthyMin"`
 	Recommended float64 `json:"recommended"`
 	Threshold   float64 `json:"threshold"`
-	Calibrated  bool    `json:"calibrated"`
-	Warning     string  `json:"warning,omitempty"`
+	// Ignored counts recent rows left over from a different prompt or threshold,
+	// so a stale ring is distinguishable from a genuine lack of samples.
+	Ignored    int    `json:"ignored"`
+	Calibrated bool   `json:"calibrated"`
+	Warning    string `json:"warning,omitempty"`
+}
+
+// accountProbePromptFingerprint identifies the prompt a result was measured with,
+// so a calibration can tell current rows from ones left over from an older prompt.
+func accountProbePromptFingerprint(prompt string) string {
+	trimmed := strings.TrimSpace(prompt)
+	if trimmed == "" {
+		return "default"
+	}
+	digest := fnv.New32a()
+	_, _ = digest.Write([]byte(trimmed))
+	return strconv.FormatUint(uint64(digest.Sum32()), 16)
 }
 
 // minCalibrationSamples is how many rows a band needs before its edge is trusted.
@@ -1057,10 +1082,15 @@ func (s *Service) RatioSummary() RatioSummary {
 	copy(values, s.recent)
 	s.mu.RUnlock()
 
-	threshold := s.Config().RatioThreshold
+	cfg := s.Config()
+	threshold := cfg.RatioThreshold
 	if threshold <= 0 {
 		threshold = accountProbeDefaultRatio
 	}
+	// Only rows measured under the current prompt and threshold count. The ring is
+	// shared across configuration changes, so mixing eras would report a gap that
+	// does not hold under the settings actually in force.
+	currentPrompt := accountProbePromptFingerprint(cfg.Prompt)
 	summary := RatioSummary{Threshold: threshold}
 
 	degradedMax := 0.0
@@ -1068,6 +1098,14 @@ func (s *Service) RatioSummary() RatioSummary {
 	for _, value := range values {
 		ratio := value.ReasoningRatio
 		if ratio <= 0 {
+			continue
+		}
+		if value.ProbePrompt != "" && value.ProbePrompt != currentPrompt {
+			summary.Ignored++
+			continue
+		}
+		if value.ProbeThreshold > 0 && math.Abs(value.ProbeThreshold-threshold) > 0.001 {
+			summary.Ignored++
 			continue
 		}
 		summary.Samples++

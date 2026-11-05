@@ -106,6 +106,8 @@ export type AccountProbeCalibration = {
   healthyMin: number;
   recommended: number;
   threshold: number;
+  /** Rows left over from a different prompt or threshold, excluded from the check. */
+  ignored: number;
   calibrated: boolean;
   warning?: string;
 };
@@ -192,6 +194,7 @@ const calibrationShape = hasShape({
   healthyMin: isNumber,
   recommended: isNumber,
   threshold: isNumber,
+  ignored: isNumber,
   calibrated: isBoolean,
   warning: isOptional(isString),
 });

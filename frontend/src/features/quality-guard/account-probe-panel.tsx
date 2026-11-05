@@ -361,6 +361,11 @@ export function AccountProbePanel({ accountIds }: { accountIds?: number[] } = {}
                 {`${t("accountProbe.calibrationRecommended", "建议")} ${query.data.calibration.recommended}`}
               </span>
             ) : null}
+            {query.data.calibration.ignored > 0 ? (
+              <span>
+                {`${t("accountProbe.calibrationIgnored", "已排除旧配置样本")} ${query.data.calibration.ignored}`}
+              </span>
+            ) : null}
           </div>
           {query.data.calibration.warning ? (
             <div className="mt-1">{query.data.calibration.warning}</div>
