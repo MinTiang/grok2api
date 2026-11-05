@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -97,7 +98,11 @@ type AccountProbeResult struct {
 	// EncryptionFloor is the encrypted length this reply had to reach, derived
 	// from its own claimed reasoning tokens. Surfacing it makes a rejection
 	// explainable instead of a bare verdict.
-	EncryptionFloor int64     `json:"encryptionFloor"`
+	EncryptionFloor int64 `json:"encryptionFloor"`
+	// ReasoningRatio is the measured bytes of encrypted reasoning per claimed
+	// reasoning token. Healthy accounts sit at 4.46-4.94 and degraded ones at
+	// 1.59-1.94, so this single number explains any verdict.
+	ReasoningRatio  float64   `json:"reasoningRatio"`
 	OutputTokens    int64     `json:"outputTokens"`
 	ReasoningTokens int64     `json:"reasoningTokens"`
 	VisibleChars    int       `json:"visibleChars"`
@@ -424,6 +429,9 @@ func (s *Service) ProbeAccount(ctx context.Context, input AccountProbeInput) (Ac
 	result.ReasoningBytes = max(reasoningDeltaBytes, encryptedBytes)
 	encryptionFloor := encryptedThinkingFloor(accountProbeMinEncryptedBytes, accountProbeEncryptedBytesPerToken, usage.ReasoningTokens)
 	result.EncryptionFloor = encryptionFloor
+	if usage.ReasoningTokens > 0 {
+		result.ReasoningRatio = math.Round(float64(encryptedBytes)/float64(usage.ReasoningTokens)*100) / 100
+	}
 	result.HasThinking = reasoningDeltaBytes > 0 || int64(encryptedBytes) >= encryptionFloor
 	result.OutputTokens = usage.OutputTokens
 	result.ReasoningTokens = usage.ReasoningTokens
@@ -545,9 +553,13 @@ const (
 	// before the visible answer starts.
 	accountProbeMinOutputTokens = 128
 	// Encrypted reasoning must scale with the reasoning tokens the reply claims,
-	// or it is a stub. These mirror the request-path classifier's defaults.
+	// or it is a stub. Calibrated on 38 measured rows: healthy accounts sit at
+	// 4.46-4.94 bytes per claimed reasoning token, degraded ones at 1.59-1.94, a
+	// 2.3x gap. A threshold of 3 sits mid-gap with over 1.0 of margin on both
+	// sides; the previous value of 4 left only 0.46 above the healthy floor and
+	// would misjudge a healthy account that dipped.
 	accountProbeMinEncryptedBytes      = 256
-	accountProbeEncryptedBytesPerToken = 4
+	accountProbeEncryptedBytesPerToken = 3
 	// accountProbeThinkingThreshold is the first-visible-token delay that counts
 	// as evidence of thinking. A model that reasons emits its first visible token
 	// well after this; a degraded account dumps the answer immediately. It is the

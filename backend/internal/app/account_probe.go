@@ -139,6 +139,7 @@ func (a *accountProbeAdapter) probe(ctx context.Context, input accountprobe.Prob
 		ReasoningDeltaBytes: result.ReasoningDeltaBytes,
 		EncryptedBytes:      result.EncryptedBytes,
 		EncryptionFloor:     result.EncryptionFloor,
+		ReasoningRatio:      result.ReasoningRatio,
 		FirstVisibleMS:      result.FirstVisibleMS,
 		Mode:                result.Mode,
 		ToolCallOK:          result.ToolCallOK,

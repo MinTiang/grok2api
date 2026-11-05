@@ -50,7 +50,10 @@ const (
 	// built from. A single sample is not trustworthy: measured on one account it
 	// returned a complete call, then prose, then a call again, because the model
 	// does not follow tool_choice=required deterministically.
-	accountProbeToolSamples = 5
+	accountProbeThinkingSamples   = 3
+	accountProbeThinkingMajority  = 2
+	accountProbeThinkingSampleGap = 5 * time.Second
+	accountProbeToolSamples       = 5
 	// accountProbeToolMajority is how many of those samples must carry a complete
 	// call before the account counts as able to call tools.
 	accountProbeToolMajority = 4
@@ -186,6 +189,7 @@ type ProbeResult struct {
 	ReasoningDeltaBytes int
 	EncryptedBytes      int
 	EncryptionFloor     int64
+	ReasoningRatio      float64
 	FirstVisibleMS      int64
 	Mode                string
 	ToolCallOK          bool
@@ -259,6 +263,7 @@ type ResultView struct {
 	ReasoningDeltaBytes int       `json:"reasoningDeltaBytes"`
 	EncryptedBytes      int       `json:"encryptedBytes"`
 	EncryptionFloor     int64     `json:"encryptionFloor"`
+	ReasoningRatio      float64   `json:"reasoningRatio"`
 	FirstVisibleMS      int64     `json:"firstVisibleMs"`
 	Mode                string    `json:"mode,omitempty"`
 	ToolCallOK          bool      `json:"toolCallOk"`
@@ -668,6 +673,91 @@ func (s *Service) execute(ctx context.Context, runID string, cfg Config, account
 	wg.Wait()
 }
 
+// sampleThinkingMode probes several times and decides by majority.
+//
+// A single thinking sample is not trustworthy because the degradation is
+// transient. Measured on one fleet, the same account produced an encrypted
+// payload of 4.79 bytes per claimed reasoning token on one run and 1.76 on the
+// next, so a one-shot verdict flips between healthy and degraded from minute to
+// minute. The ratio itself is a sound measurement of that moment; what is unstable
+// is the account. Majority over several samples is what turns it into a property.
+func (s *Service) sampleThinkingMode(ctx context.Context, input ProbeInput, accountID uint64) ProbeResult {
+	var best ProbeResult
+	var lastError ProbeResult
+	degraded, healthy, responded := 0, 0, 0
+	for sample := 0; sample < accountProbeThinkingSamples; sample++ {
+		if sample > 0 {
+			select {
+			case <-ctx.Done():
+			case <-time.After(accountProbeThinkingSampleGap):
+			}
+			if ctx.Err() != nil {
+				break
+			}
+		}
+		result, err := s.prober.ProbeAccount(ctx, input)
+		if err != nil || result.Verdict == VerdictError {
+			// A pinned account can still be refused while its previous slot is
+			// being released, so give one failed sample a second chance before it
+			// counts as a dead attempt.
+			if ctx.Err() == nil {
+				select {
+				case <-ctx.Done():
+				case <-time.After(accountProbeThinkingSampleGap):
+				}
+				if retryResult, retryErr := s.prober.ProbeAccount(ctx, input); retryErr == nil {
+					result, err = retryResult, nil
+				}
+			}
+		}
+		if err != nil {
+			lastError = ProbeResult{AccountID: accountID, Verdict: VerdictError, Reason: "probe_failed", Error: err.Error()}
+			continue
+		}
+		if result.Reason == "account_disabled" {
+			return result
+		}
+		if result.Verdict == VerdictError {
+			lastError = result
+			continue
+		}
+		responded++
+		if result.Verdict == VerdictHard {
+			degraded++
+		} else {
+			healthy++
+		}
+		// Keep the most recent sample so the row carries a real ratio.
+		best = result
+		if degraded >= accountProbeThinkingMajority {
+			break
+		}
+		if healthy >= accountProbeThinkingMajority {
+			break
+		}
+	}
+	switch {
+	case degraded >= accountProbeThinkingMajority:
+		best.Verdict = VerdictHard
+		best.Reason = "thinking_missing"
+		best.HasThinking = false
+	case healthy >= accountProbeThinkingMajority:
+		best.Verdict = VerdictHealthy
+		best.Reason = "thinking_present"
+		best.HasThinking = true
+	case responded > 0:
+		// No majority: a single sample is not enough to act on, and cooling on a
+		// coin flip would punish healthy accounts half the time.
+		return ProbeResult{AccountID: accountID, Verdict: VerdictError, Reason: "probe_inconclusive", Error: "多次采样结果不一致，本次不判定"}
+	case lastError.Verdict != "":
+		return lastError
+	default:
+		return ProbeResult{AccountID: accountID, Verdict: VerdictError, Reason: "probe_failed", Error: "多次采样均未拿到响应"}
+	}
+	s.logger.Info("account_probe_sampled", "account_id", accountID, "mode", "thinking", "degraded", degraded, "healthy", healthy, "verdict", best.Verdict)
+	return best
+}
+
 // sampleToolMode runs the probe several times and decides by majority.
 //
 // Tool mode cannot rely on a single call. Measured on one account, three
@@ -773,7 +863,7 @@ func (s *Service) probeOne(ctx context.Context, runID string, cfg Config, accoun
 	if cfg.Mode == AccountProbeModeTool {
 		result = s.sampleToolMode(probeCtx, input, accountID)
 	} else {
-		result, err = s.prober.ProbeAccount(probeCtx, input)
+		result = s.sampleThinkingMode(probeCtx, input, accountID)
 	}
 	view := ResultView{
 		AccountID: accountID, ProbedAt: time.Now().UTC(),
@@ -788,9 +878,9 @@ func (s *Service) probeOne(ctx context.Context, runID string, cfg Config, accoun
 			Verdict: result.Verdict, Reason: result.Reason, StatusCode: result.StatusCode,
 			HasThinking: result.HasThinking, ReasoningBytes: result.ReasoningBytes,
 			ReasoningDeltaBytes: result.ReasoningDeltaBytes, EncryptedBytes: result.EncryptedBytes,
-			EncryptionFloor: result.EncryptionFloor,
-			FirstVisibleMS:  result.FirstVisibleMS,
-			Mode:            result.Mode, ToolCallOK: result.ToolCallOK,
+			EncryptionFloor: result.EncryptionFloor, ReasoningRatio: result.ReasoningRatio,
+			FirstVisibleMS: result.FirstVisibleMS,
+			Mode:           result.Mode, ToolCallOK: result.ToolCallOK,
 			ToolName: result.ToolName, ToolArgs: result.ToolArgs,
 			OutputTokens: result.OutputTokens, ReasoningTokens: result.ReasoningTokens,
 			VisibleChars: result.VisibleChars, FirstTokenMS: result.FirstTokenMS,
@@ -821,7 +911,7 @@ func (s *Service) probeOne(ctx context.Context, runID string, cfg Config, accoun
 	s.logger.Info("account_probe_done",
 		"account_id", accountID, "verdict", view.Verdict, "reason", view.Reason,
 		"mode", view.Mode, "tool_call_ok", view.ToolCallOK, "tool_name", view.ToolName,
-		"has_thinking", view.HasThinking, "reasoning_bytes", view.ReasoningBytes,
+		"has_thinking", view.HasThinking, "reasoning_bytes", view.ReasoningBytes, "ratio", view.ReasoningRatio,
 		"output_tokens", view.OutputTokens, "first_visible_ms", view.FirstVisibleMS,
 		"early_stop", view.EarlyStop, "penalized", view.Penalized)
 }
