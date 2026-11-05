@@ -40,8 +40,10 @@ const (
 	// The capability the probe tests by default is:
 	// harder signal than reasoning volume: it is visible the moment the call lands.
 	defaultMode = AccountProbeModeThinking
-	// probeTimeout bounds a single account probe.
-	probeTimeout = 90 * time.Second
+	// probeTimeout bounds one account's whole probe, including its samples and the
+	// gap between them. Five thinking samples of 20-30s plus gaps need more than
+	// the single-sample budget this used to be.
+	probeTimeout = 300 * time.Second
 	// penaltyTimeout bounds the account write that follows a degraded verdict.
 	penaltyTimeout = 10 * time.Second
 	// maxRecentResults bounds the in-memory result ring used by the panel.
@@ -50,8 +52,8 @@ const (
 	// built from. A single sample is not trustworthy: measured on one account it
 	// returned a complete call, then prose, then a call again, because the model
 	// does not follow tool_choice=required deterministically.
-	accountProbeThinkingSamples   = 3
-	accountProbeThinkingMajority  = 2
+	accountProbeThinkingSamples   = 5
+	accountProbeThinkingMajority  = 3
 	accountProbeThinkingSampleGap = 5 * time.Second
 	accountProbeToolSamples       = 5
 	// accountProbeToolMajority is how many of those samples must carry a complete
@@ -191,6 +193,7 @@ type ProbeResult struct {
 	EncryptionFloor     int64
 	ReasoningRatio      float64
 	FirstVisibleMS      int64
+	AnswerExcerpt       string
 	Mode                string
 	ToolCallOK          bool
 	ToolName            string
@@ -265,6 +268,7 @@ type ResultView struct {
 	EncryptionFloor     int64     `json:"encryptionFloor"`
 	ReasoningRatio      float64   `json:"reasoningRatio"`
 	FirstVisibleMS      int64     `json:"firstVisibleMs"`
+	AnswerExcerpt       string    `json:"answerExcerpt,omitempty"`
 	Mode                string    `json:"mode,omitempty"`
 	ToolCallOK          bool      `json:"toolCallOk"`
 	ToolName            string    `json:"toolName,omitempty"`
@@ -729,10 +733,11 @@ func (s *Service) sampleThinkingMode(ctx context.Context, input ProbeInput, acco
 		}
 		// Keep the most recent sample so the row carries a real ratio.
 		best = result
-		if degraded >= accountProbeThinkingMajority {
+		if degraded >= accountProbeThinkingMajority || healthy >= accountProbeThinkingMajority {
 			break
 		}
-		if healthy >= accountProbeThinkingMajority {
+		// Stop once neither side can still reach a majority.
+		if accountProbeThinkingSamples-responded < accountProbeThinkingMajority-max(degraded, healthy) {
 			break
 		}
 	}
@@ -879,8 +884,8 @@ func (s *Service) probeOne(ctx context.Context, runID string, cfg Config, accoun
 			HasThinking: result.HasThinking, ReasoningBytes: result.ReasoningBytes,
 			ReasoningDeltaBytes: result.ReasoningDeltaBytes, EncryptedBytes: result.EncryptedBytes,
 			EncryptionFloor: result.EncryptionFloor, ReasoningRatio: result.ReasoningRatio,
-			FirstVisibleMS: result.FirstVisibleMS,
-			Mode:           result.Mode, ToolCallOK: result.ToolCallOK,
+			FirstVisibleMS: result.FirstVisibleMS, AnswerExcerpt: result.AnswerExcerpt,
+			Mode: result.Mode, ToolCallOK: result.ToolCallOK,
 			ToolName: result.ToolName, ToolArgs: result.ToolArgs,
 			OutputTokens: result.OutputTokens, ReasoningTokens: result.ReasoningTokens,
 			VisibleChars: result.VisibleChars, FirstTokenMS: result.FirstTokenMS,
@@ -912,7 +917,7 @@ func (s *Service) probeOne(ctx context.Context, runID string, cfg Config, accoun
 		"account_id", accountID, "verdict", view.Verdict, "reason", view.Reason,
 		"mode", view.Mode, "tool_call_ok", view.ToolCallOK, "tool_name", view.ToolName,
 		"has_thinking", view.HasThinking, "reasoning_bytes", view.ReasoningBytes, "ratio", view.ReasoningRatio,
-		"output_tokens", view.OutputTokens, "first_visible_ms", view.FirstVisibleMS,
+		"output_tokens", view.OutputTokens, "first_visible_ms", view.FirstVisibleMS, "answer", view.AnswerExcerpt,
 		"early_stop", view.EarlyStop, "penalized", view.Penalized)
 }
 

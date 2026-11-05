@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/chenyme/grok2api/backend/internal/domain/audit"
 	"github.com/chenyme/grok2api/backend/internal/domain/clientkey"
@@ -89,6 +90,10 @@ type AccountProbeResult struct {
 	// measured on real accounts, degraded ones delay their answer just as long as
 	// healthy ones, so it cannot decide a verdict.
 	FirstVisibleMS int64 `json:"firstVisibleMs"`
+	// AnswerExcerpt is the start of the visible answer. The probe prompt has a
+	// verifiable answer, so keeping the text lets answer quality be checked
+	// against the ratio instead of assuming the ratio means anything on its own.
+	AnswerExcerpt string `json:"answerExcerpt,omitempty"`
 	// Tool mode outcome. ToolCallOK is the verdict signal: the model either invoked
 	// the tool with complete arguments or it did not.
 	Mode       string `json:"mode,omitempty"`
@@ -435,7 +440,9 @@ func (s *Service) ProbeAccount(ctx context.Context, input AccountProbeInput) (Ac
 	result.HasThinking = reasoningDeltaBytes > 0 || int64(encryptedBytes) >= encryptionFloor
 	result.OutputTokens = usage.OutputTokens
 	result.ReasoningTokens = usage.ReasoningTokens
-	result.VisibleChars = len(visible.String())
+	answerText := visible.String()
+	result.VisibleChars = len(answerText)
+	result.AnswerExcerpt = truncateAccountProbeAnswer(answerText)
 	result.EarlyStop = earlyStop
 	if !firstVisibleAt.IsZero() {
 		result.FirstVisibleMS = firstVisibleAt.Sub(startedAt).Milliseconds()
@@ -552,6 +559,8 @@ const (
 	// Anything below this is treated as unset: reasoning needs room to stream
 	// before the visible answer starts.
 	accountProbeMinOutputTokens = 128
+	// accountProbeAnswerExcerptBytes bounds the answer text kept for quality checks.
+	accountProbeAnswerExcerptBytes = 160
 	// Encrypted reasoning must scale with the reasoning tokens the reply claims,
 	// or it is a stub. Calibrated on 38 measured rows: healthy accounts sit at
 	// 4.46-4.94 bytes per claimed reasoning token, degraded ones at 1.59-1.94, a
@@ -835,6 +844,22 @@ func normalizeAccountProbeMode(value string) string {
 		return AccountProbeModeThinking
 	}
 	return AccountProbeModeTool
+}
+
+// truncateAccountProbeAnswer keeps a short, safe prefix of the visible answer.
+// The probe prompt has a checkable answer, so this text is what lets answer
+// quality be compared against the reasoning ratio afterwards.
+func truncateAccountProbeAnswer(value string) string {
+	trimmed := strings.TrimSpace(value)
+	if len(trimmed) <= accountProbeAnswerExcerptBytes {
+		return trimmed
+	}
+	cut := accountProbeAnswerExcerptBytes
+	// Do not split a multi-byte rune.
+	for cut > 0 && !utf8.RuneStart(trimmed[cut]) {
+		cut--
+	}
+	return strings.TrimSpace(trimmed[:cut])
 }
 
 // IsAccountProbePenalizable reports whether a verdict should cool the account.
