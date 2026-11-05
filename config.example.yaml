@@ -136,10 +136,11 @@ accountProbe:
   workers: 2
   model: "grok-4.6"
   prompt: ""
-  # 推理与可见回复共用这个预算，设得太小会在推理流出前就被截断，
-  # 把健康号误判成降智。真正控制成本的是下面的早停。
+  # 可见回复的上限。注意 Build 不把它当作真实上限：实测设 48 仍产出
+  # 1300–3900 个输出 token，因为推理不计入这个预算。
   maxOutputTokens: 512
-  # 见到 thinking 即停，这是省额度的关键；healthy 号只花几十个 token。
+  # Build 在流末尾才给出推理证据，早停实际不会触发，每次短测都会跑完整回复。
+  # 真正控制成本的是 chunkSize 与 interval。
   earlyStopOnThinking: true
   earlyStopDelay: 800ms
   # 判定降智后的处置。

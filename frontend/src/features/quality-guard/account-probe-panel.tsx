@@ -299,6 +299,12 @@ export function AccountProbePanel({ accountIds }: { accountIds?: number[] } = {}
                 />
               </div>
             </label>
+            <p className="text-xs text-muted-foreground sm:col-span-2 lg:col-span-4">
+              {t(
+                "accountProbe.fullRequestNotice",
+                "注意：Build 在流末尾才给出推理证据，早停实际不会触发，每次短测都会跑完整回复（约 1.3k–3.9k token）。控制成本请调整每轮账号数或轮测间隔。",
+              )}
+            </p>
             <div className="sm:col-span-2 lg:col-span-4">
               <Button
                 size="sm"

@@ -46,9 +46,11 @@ type AccountProbeInput struct {
 	Model           string
 	Prompt          string
 	MaxOutputTokens int
-	// EarlyStopOnThinking stops reading as soon as reasoning content arrives.
-	// This is what keeps the probe cheap: a healthy account costs a handful of
-	// reasoning tokens, and a degraded account is cut off at the reply cap.
+	// EarlyStopOnThinking stops reading as soon as reasoning evidence arrives.
+	// It is kept because the wire format allows it, but on Build it never fires:
+	// the encrypted-reasoning marker is emitted at the tail of the stream, after
+	// the visible reply has already been sent, so every probe runs to completion.
+	// Cost has to be controlled through chunk size and interval instead.
 	EarlyStopOnThinking bool
 	// EarlyStopDelayMS delays the early stop after reasoning is first observed so
 	// that partially streamed reasoning is not mistaken for a complete thought.
@@ -391,9 +393,11 @@ var accountProbeRiskMarkers = []string{
 
 const (
 	defaultAccountProbePrompt = "Think step by step. A clock shows 3:27. What is the smaller angle in degrees between the hour and minute hands, rounded to the nearest integer? Reply with only that integer on the first line and QUALITY_OK on the last line."
-	// Reasoning shares this budget with the visible answer, so a tight cap can
-	// truncate before any reasoning reaches the stream, which would make a
-	// healthy account look degraded. Early stop is what bounds the real cost.
+	// A tight cap truncates the reply before the encrypted-reasoning marker is
+	// emitted, which would make a healthy account look degraded. Note that Build
+	// does not honour this as a real ceiling: probes with a cap of 48 still
+	// produced 1300-3900 output tokens, because reasoning is not counted against
+	// it. Treat it as a safety net for the visible reply, not a cost control.
 	defaultAccountProbeMaxOutputTokens = 512
 	defaultAccountProbeEarlyStopDelay  = 800 * time.Millisecond
 	// Anything below this is treated as unset: reasoning needs room to stream
