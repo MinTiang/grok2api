@@ -361,7 +361,9 @@ func normalizeConfig(value Config) Config {
 		value.Model = defaultModel
 	}
 	if value.MaxOutputTokens <= 0 {
-		value.MaxOutputTokens = 48
+		// Reasoning draws from the same budget as the visible answer, so this has
+		// to be loose enough that thinking is not cut off before it streams.
+		value.MaxOutputTokens = 512
 	}
 	if value.Cooldown <= 0 {
 		value.Cooldown = defaultCooldown

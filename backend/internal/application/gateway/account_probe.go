@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -114,7 +115,10 @@ func (s *Service) ProbeAccount(ctx context.Context, input AccountProbeInput) (Ac
 		prompt = defaultAccountProbePrompt
 	}
 	maxOutput := input.MaxOutputTokens
-	if maxOutput <= 0 {
+	// Reasoning draws from this budget, so a tiny cap would end the reply before
+	// any reasoning streams and mislabel a healthy account. Clamp from below and
+	// let early stop keep the real cost down.
+	if maxOutput < accountProbeMinOutputTokens {
 		maxOutput = defaultAccountProbeMaxOutputTokens
 	}
 
@@ -214,12 +218,25 @@ func (s *Service) ProbeAccount(ctx context.Context, input AccountProbeInput) (Ac
 			break
 		}
 		trimmed := strings.TrimSpace(string(line))
-		if trimmed == ": grok2api-reasoning-start" {
+		// Build streams to Chat Completions never carry reasoning text in
+		// delta.reasoning: the converter emits an empty stub comment plus the
+		// encrypted-content length instead. Both markers are comments that SSE
+		// clients ignore, so they are the only in-band proof of thinking.
+		if trimmed == qualityReasoningSSEComment {
 			if firstGeneratedAt.IsZero() {
 				firstGeneratedAt = time.Now()
 				if answer.MarkFirstToken != nil {
 					answer.MarkFirstToken()
 				}
+			}
+			continue
+		}
+		if evidence, ok := parseReasoningEvidenceComment(trimmed); ok {
+			if evidence > reasoningBytes {
+				reasoningBytes = evidence
+			}
+			if firstReasoningAt.IsZero() {
+				firstReasoningAt = time.Now()
 			}
 			continue
 		}
@@ -250,6 +267,8 @@ func (s *Service) ProbeAccount(ctx context.Context, input AccountProbeInput) (Ac
 			if delta.Content != "" {
 				visible.WriteString(delta.Content)
 			}
+			// Kept for providers that do stream plaintext reasoning deltas; on
+			// Build this is always empty and the comment markers above decide.
 			reasoning := delta.Reasoning + delta.ReasoningContent + delta.ThinkingContent
 			if reasoning != "" {
 				reasoningBytes += len(reasoning)
@@ -352,9 +371,15 @@ var accountProbeRiskMarkers = []string{
 }
 
 const (
-	defaultAccountProbePrompt          = "Think step by step. A clock shows 3:27. What is the smaller angle in degrees between the hour and minute hands, rounded to the nearest integer? Reply with only that integer on the first line and QUALITY_OK on the last line."
-	defaultAccountProbeMaxOutputTokens = 48
+	defaultAccountProbePrompt = "Think step by step. A clock shows 3:27. What is the smaller angle in degrees between the hour and minute hands, rounded to the nearest integer? Reply with only that integer on the first line and QUALITY_OK on the last line."
+	// Reasoning shares this budget with the visible answer, so a tight cap can
+	// truncate before any reasoning reaches the stream, which would make a
+	// healthy account look degraded. Early stop is what bounds the real cost.
+	defaultAccountProbeMaxOutputTokens = 512
 	defaultAccountProbeEarlyStopDelay  = 800 * time.Millisecond
+	// Anything below this is treated as unset: reasoning needs room to stream
+	// before the visible answer starts.
+	accountProbeMinOutputTokens = 128
 )
 
 // IsAccountProbePenalizable reports whether a verdict should cool the account.
@@ -362,4 +387,26 @@ const (
 // the account; only a completed reply that carries no reasoning does.
 func IsAccountProbePenalizable(verdict string) bool {
 	return verdict == AccountProbeHard
+}
+
+// parseReasoningEvidenceComment reads the encrypted-reasoning byte count from the
+// `: grok2api-reasoning-evidence <n>` SSE comment.
+//
+// The converter folds upstream reasoning into encrypted_content, so its length is
+// the only measurable trace left after protocol conversion. A degraded account
+// emits the start stub but never an evidence line.
+func parseReasoningEvidenceComment(line string) (int, bool) {
+	const prefix = qualityReasoningEvidenceSSEComment
+	if !strings.HasPrefix(line, prefix) {
+		return 0, false
+	}
+	raw := strings.TrimSpace(strings.TrimPrefix(line, prefix))
+	if raw == "" {
+		return 0, false
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value <= 0 {
+		return 0, false
+	}
+	return value, true
 }

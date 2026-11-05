@@ -1,6 +1,10 @@
 package gateway
 
-import "testing"
+import (
+	"bufio"
+	"strings"
+	"testing"
+)
 
 // TestClassifyAccountProbeResult pins the core contract: the verdict comes from
 // streamed thinking only. TPS and token counts are diagnostics.
@@ -80,5 +84,77 @@ func TestClassifyAccountProbeFailure(t *testing.T) {
 				t.Fatalf("got %q, want %q", got, testCase.want)
 			}
 		})
+	}
+}
+
+// TestParseReasoningEvidenceComment covers the marker that actually decides the
+// verdict. Chat deltas never carry reasoning on Build: the converter emits an
+// empty start stub plus this byte count, so missing it makes every account look
+// degraded.
+func TestParseReasoningEvidenceComment(t *testing.T) {
+	cases := []struct {
+		line   string
+		want   int
+		wantOK bool
+	}{
+		{": grok2api-reasoning-evidence 512", 512, true},
+		{": grok2api-reasoning-evidence   4096  ", 4096, true},
+		{": grok2api-reasoning-start", 0, false},
+		{": grok2api-reasoning-evidence", 0, false},
+		{": grok2api-reasoning-evidence 0", 0, false},
+		{": grok2api-reasoning-evidence abc", 0, false},
+		{"data: {\"id\":\"x\"}", 0, false},
+	}
+	for _, testCase := range cases {
+		got, ok := parseReasoningEvidenceComment(testCase.line)
+		if ok != testCase.wantOK || got != testCase.want {
+			t.Fatalf("parseReasoningEvidenceComment(%q) = (%d, %v), want (%d, %v)", testCase.line, got, ok, testCase.want, testCase.wantOK)
+		}
+	}
+}
+
+// TestProbeStreamMarkersDecideVerdict pins the distinction the probe relies on:
+// the start stub alone is not proof of thinking (a degraded build still emits it),
+// while an evidence line is. Chat deltas carry no reasoning on Build, so reading
+// only delta.reasoning reported every account as degraded.
+func TestProbeStreamMarkersDecideVerdict(t *testing.T) {
+	healthyStream := strings.Join([]string{
+		": grok2api-reasoning-start",
+		"",
+		": grok2api-reasoning-evidence 512",
+		"",
+		`data: {"id":"resp_1","choices":[{"delta":{"content":"63"}}]}`,
+		"",
+		"data: [DONE]",
+		"",
+	}, "\n")
+	degradedStream := strings.Join([]string{
+		": grok2api-reasoning-start",
+		"",
+		`data: {"id":"resp_2","choices":[{"delta":{"content":"63"}}]}`,
+		"",
+		"data: [DONE]",
+		"",
+	}, "\n")
+
+	scan := func(stream string) int {
+		reasoningBytes := 0
+		scanner := bufio.NewScanner(strings.NewReader(stream))
+		for scanner.Scan() {
+			trimmed := strings.TrimSpace(scanner.Text())
+			if reasoningBytes == 0 {
+				if evidence, ok := parseReasoningEvidenceComment(trimmed); ok {
+					reasoningBytes = evidence
+				}
+			}
+		}
+		return reasoningBytes
+	}
+
+	if got := scan(healthyStream); got != 512 {
+		t.Fatalf("healthy stream reasoning bytes = %d, want 512", got)
+	}
+	if got := scan(degradedStream); got != 0 {
+		t.Fatalf("degraded stream reasoning bytes = %d, want 0 (start stub is not proof)", got)
 	}
 }

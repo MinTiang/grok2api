@@ -274,7 +274,9 @@ export function AccountProbePanel({ accountIds }: { accountIds?: number[] } = {}
               <span className="text-xs font-medium text-muted-foreground">{t("accountProbe.maxTokens", "回复上限 Token")}</span>
               <Input
                 type="number"
-                min={8}
+                // Reasoning shares this budget, so a small cap truncates before any
+                // thinking streams and makes healthy accounts look degraded.
+                min={128}
                 value={config.maxOutputTokens}
                 onChange={(event) => setDraft({ ...config, maxOutputTokens: Number(event.target.value) })}
               />

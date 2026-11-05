@@ -136,7 +136,9 @@ accountProbe:
   workers: 2
   model: "grok-4.6"
   prompt: ""
-  maxOutputTokens: 48
+  # 推理与可见回复共用这个预算，设得太小会在推理流出前就被截断，
+  # 把健康号误判成降智。真正控制成本的是下面的早停。
+  maxOutputTokens: 512
   # 见到 thinking 即停，这是省额度的关键；healthy 号只花几十个 token。
   earlyStopOnThinking: true
   earlyStopDelay: 800ms
