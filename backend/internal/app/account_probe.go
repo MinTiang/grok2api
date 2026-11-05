@@ -92,15 +92,37 @@ func (a *accountProbeAdapter) ResolveAccountProbeIdentity(ctx context.Context) (
 
 // ProbeAccount implements accountprobe.Prober.
 func (a *accountProbeAdapter) ProbeAccount(ctx context.Context, input accountprobe.ProbeInput) (accountprobe.ProbeResult, error) {
-	result, err := a.gateway.ProbeAccount(ctx, gateway.AccountProbeInput{
-		AccountID:           input.AccountID,
-		ClientKeyID:         input.ClientKeyID,
-		Model:               input.Model,
-		Prompt:              input.Prompt,
-		MaxOutputTokens:     input.MaxOutputTokens,
-		EarlyStopOnThinking: input.EarlyStopOnThinking,
-		EarlyStopDelayMS:    input.EarlyStopDelayMS,
-	})
+	return a.probe(ctx, input)
+}
+
+// probe retries once after re-enabling the internal identity.
+//
+// The identity is shared with the egress quality guard and startup sets its
+// enabled flag from the two feature switches. Enabling the probe from the panel
+// after a boot where both were off therefore leaves the key disabled, and every
+// probe would fail with a disabled-key error until the next restart.
+func (a *accountProbeAdapter) probe(ctx context.Context, input accountprobe.ProbeInput) (accountprobe.ProbeResult, error) {
+	call := func(clientKeyID uint64) (gateway.AccountProbeResult, error) {
+		return a.gateway.ProbeAccount(ctx, gateway.AccountProbeInput{
+			AccountID:           input.AccountID,
+			ClientKeyID:         clientKeyID,
+			Model:               input.Model,
+			Prompt:              input.Prompt,
+			MaxOutputTokens:     input.MaxOutputTokens,
+			EarlyStopOnThinking: input.EarlyStopOnThinking,
+			EarlyStopDelayMS:    input.EarlyStopDelayMS,
+		})
+	}
+	result, err := call(input.ClientKeyID)
+	if err != nil && errors.Is(err, gateway.ErrAccountProbeKeyUnavailable) {
+		key, ensureErr := a.keys.EnsureQualityGuardIdentity(ctx, true)
+		if ensureErr == nil {
+			a.identityMu.Lock()
+			a.identityID = key.ID
+			a.identityMu.Unlock()
+			result, err = call(key.ID)
+		}
+	}
 	if err != nil {
 		return accountprobe.ProbeResult{}, err
 	}
@@ -134,10 +156,6 @@ func (a *accountProbeAdapter) CoolAccountForMissingThinking(ctx context.Context,
 	return a.accounts.ApplyMissingThinkingPenalty(ctx, accountID, cooldown, autoDisable)
 }
 
-// ListProbeCandidates implements accountprobe.AccountLister.
-//
-// Only Build accounts stream reasoning, so they are the only provider where
-// "answered without thinking" is a meaningful verdict.
 // ListProbeCandidates implements accountprobe.AccountLister.
 //
 // The status filter uses the account service's own vocabulary ("active" means

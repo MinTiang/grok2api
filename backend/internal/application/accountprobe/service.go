@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"runtime/debug"
 	"sync"
 	"time"
 
@@ -398,10 +399,22 @@ func (s *Service) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-timer.C:
-			s.runAutomaticCycle(ctx)
+			s.safeAutomaticCycle(ctx)
 			timer.Reset(s.nextDelay())
 		}
 	}
+}
+
+// safeAutomaticCycle keeps one failed cycle from killing the scheduler. This
+// loop owns the only goroutine that ever starts automatic runs, so a panic here
+// would silently stop all future sweeps.
+func (s *Service) safeAutomaticCycle(ctx context.Context) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			s.logger.Error("account_probe_cycle_panic", "panic", recovered, "stack", string(debug.Stack()))
+		}
+	}()
+	s.runAutomaticCycle(ctx)
 }
 
 func (s *Service) nextDelay() time.Duration {
@@ -518,7 +531,7 @@ func (s *Service) Start(ctx context.Context, trigger string, accountIDs []uint64
 	// Take the snapshot while still holding the lock and before the worker
 	// starts mutating the shared run record.
 	snapshot := *run
-	snapshot.Results = append([]ResultView(nil), run.Results...)
+	snapshot.Results = copyResults(run.Results)
 	s.running = true
 	probeCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	s.cancel = cancel
@@ -530,6 +543,9 @@ func (s *Service) Start(ctx context.Context, trigger string, accountIDs []uint64
 
 func (s *Service) execute(ctx context.Context, runID string, cfg Config, accountIDs []uint64) {
 	defer func() {
+		if recovered := recover(); recovered != nil {
+			s.logger.Error("account_probe_run_panic", "run_id", runID, "panic", recovered, "stack", string(debug.Stack()))
+		}
 		s.mu.Lock()
 		s.running = false
 		if s.cancel != nil {
@@ -565,6 +581,15 @@ func (s *Service) execute(ctx context.Context, runID string, cfg Config, account
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			// A panic here runs on a background goroutine, where gin.Recovery
+			// cannot reach it. Without this the whole process exits and Docker
+			// restarts the container, which is what makes the panel drop out
+			// mid-run instead of reporting a failed probe.
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					s.logger.Error("account_probe_worker_panic", "run_id", runID, "panic", recovered, "stack", string(debug.Stack()))
+				}
+			}()
 			for accountID := range queue {
 				if ctx.Err() != nil {
 					return
@@ -591,6 +616,18 @@ func (s *Service) execute(ctx context.Context, runID string, cfg Config, account
 }
 
 func (s *Service) probeOne(ctx context.Context, runID string, cfg Config, accountID uint64) {
+	// Keep a single bad probe from taking down its worker: the run must still
+	// report a verdict for this account and continue with the rest.
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			s.logger.Error("account_probe_panic", "run_id", runID, "account_id", accountID, "panic", recovered, "stack", string(debug.Stack()))
+			s.recordResult(runID, ResultView{
+				AccountID: accountID, Verdict: VerdictError, Reason: "probe_panic",
+				Error: "短测过程中发生内部错误", ProbedAt: time.Now().UTC(),
+			})
+		}
+	}()
+
 	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
 
@@ -634,9 +671,21 @@ func (s *Service) probeOne(ctx context.Context, runID string, cfg Config, accoun
 		}
 	}
 
+	// A panic below must still leave a row behind, so record before logging.
+	s.recordResult(runID, view)
+
+	s.logger.Info("account_probe_done",
+		"account_id", accountID, "verdict", view.Verdict, "has_thinking", view.HasThinking,
+		"reasoning_bytes", view.ReasoningBytes, "output_tokens", view.OutputTokens,
+		"early_stop", view.EarlyStop, "penalized", view.Penalized)
+}
+
+// recordResult appends one probe outcome to the run counters and the recent
+// history. It is the single write path so the panic handler cannot drift.
+func (s *Service) recordResult(runID string, view ResultView) {
 	s.mu.Lock()
-	run := s.runs[runID]
-	if run != nil {
+	defer s.mu.Unlock()
+	if run := s.runs[runID]; run != nil {
 		run.Done++
 		run.Results = append(run.Results, view)
 		switch view.Verdict {
@@ -657,12 +706,17 @@ func (s *Service) probeOne(ctx context.Context, runID string, cfg Config, accoun
 	if len(s.recent) > maxRecentResults {
 		s.recent = s.recent[len(s.recent)-maxRecentResults:]
 	}
-	s.mu.Unlock()
+}
 
-	s.logger.Info("account_probe_done",
-		"account_id", accountID, "verdict", view.Verdict, "has_thinking", view.HasThinking,
-		"reasoning_bytes", view.ReasoningBytes, "output_tokens", view.OutputTokens,
-		"early_stop", view.EarlyStop, "penalized", view.Penalized)
+// copyResults clones a result slice for handing to a caller.
+//
+// A nil slice would marshal to JSON null, and the panel validates `results` as an
+// array, so a run that has not finished yet would fail to decode on the client
+// even though the batch started fine.
+func copyResults(values []ResultView) []ResultView {
+	out := make([]ResultView, len(values))
+	copy(out, values)
+	return out
 }
 
 func (s *Service) run(runID string) *RunView {
@@ -684,7 +738,7 @@ func (s *Service) Runs() []RunView {
 		// Results is appended under the write lock while a batch runs, so hand
 		// callers their own backing array instead of aliasing it.
 		snapshot := *run
-		snapshot.Results = append([]ResultView(nil), run.Results...)
+		snapshot.Results = copyResults(run.Results)
 		values = append(values, snapshot)
 	}
 	return values

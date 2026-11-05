@@ -30,6 +30,12 @@ const (
 // as reasoning appears, so this is only a safety net against a runaway upstream.
 const accountProbeMaxStreamBytes = 1 << 20
 
+// ErrAccountProbeKeyUnavailable reports that the internal identity funding the
+// probe is disabled or expired. Callers re-enable it and retry once, because the
+// shared identity's enabled flag is derived from the feature switches at startup
+// and enabling the probe later would otherwise leave it switched off.
+var ErrAccountProbeKeyUnavailable = errors.New("短测 Client Key 已禁用或过期")
+
 // AccountProbeInput describes one manual or scheduled account quality probe.
 type AccountProbeInput struct {
 	AccountID uint64
@@ -128,7 +134,7 @@ func (s *Service) ProbeAccount(ctx context.Context, input AccountProbeInput) (Ac
 		return result, fmt.Errorf("读取短测 Client Key: %w", err)
 	}
 	if !key.IsAvailable(time.Now().UTC()) {
-		return result, errors.New("短测 Client Key 已禁用或过期")
+		return result, ErrAccountProbeKeyUnavailable
 	}
 	publicModel, ok := qualityProbeBuildPublicModel(input.Model)
 	if !ok {
