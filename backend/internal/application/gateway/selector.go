@@ -906,7 +906,7 @@ func (s *Selector) acquirePinned(ctx context.Context, provider account.Provider,
 					}
 					return nil, &SelectionUnavailableError{Reason: SelectionQuotaExhausted, RetryAfter: retryAfter}
 				}
-				lease, err := s.acquirePinnedCapacity(ctx, value, nil)
+				lease, err := s.acquirePinnedCapacityWithCooldown(ctx, value, nil, ignoreAccountCooldown)
 				if err != nil {
 					if errors.Is(err, errRoutingCredentialStale) {
 						return nil, pinnedUnavailableError(accountID, value.Name)
@@ -937,7 +937,7 @@ func (s *Selector) acquirePinned(ctx context.Context, provider account.Provider,
 				return nil, &SelectionUnavailableError{Reason: SelectionQuotaExhausted, RetryAfter: retryAfter}
 			}
 		}
-		lease, err := s.acquirePinnedCapacity(ctx, value, nil)
+		lease, err := s.acquirePinnedCapacityWithCooldown(ctx, value, nil, ignoreAccountCooldown)
 		if err != nil {
 			if errors.Is(err, errRoutingCredentialStale) {
 				return nil, pinnedUnavailableError(accountID, value.Name)
@@ -2104,9 +2104,21 @@ func (s *Selector) claimAccountSlot(ctx context.Context, value account.Credentia
 }
 
 func (s *Selector) claimAccountSlotTracked(ctx context.Context, value account.Credential, materialFailures *credentialMaterialFailureTracker) (*accountLease, error) {
+	return s.claimAccountSlotTrackedWithCooldown(ctx, value, materialFailures, false)
+}
+
+// claimAccountSlotTrackedWithCooldown is the same claim, optionally ignoring a
+// cooling window.
+//
+// The cooldown check has to be skippable here as well as in acquirePinned.
+// Without the flag reaching this layer a cooled account simply returns no slot,
+// the caller reports SelectionSaturated, and the probe can never re-verify an
+// account it cooled itself - so a genuinely broken account cycles through
+// cooldown forever instead of being escalated to a disabled state.
+func (s *Selector) claimAccountSlotTrackedWithCooldown(ctx context.Context, value account.Credential, materialFailures *credentialMaterialFailureTracker, ignoreCooldown bool) (*accountLease, error) {
 	now := time.Now().UTC()
 	value = s.applyRoutingHealth(value, now)
-	if value.CooldownUntil != nil && now.Before(*value.CooldownUntil) {
+	if !ignoreCooldown && value.CooldownUntil != nil && now.Before(*value.CooldownUntil) {
 		return nil, nil
 	}
 	limit := value.MaxConcurrent
@@ -2148,10 +2160,14 @@ func (s *Selector) claimAccountSlotTracked(ctx context.Context, value account.Cr
 }
 
 func (s *Selector) acquirePinnedCapacity(ctx context.Context, value account.Credential, materialFailures *credentialMaterialFailureTracker) (*accountLease, error) {
+	return s.acquirePinnedCapacityWithCooldown(ctx, value, materialFailures, false)
+}
+
+func (s *Selector) acquirePinnedCapacityWithCooldown(ctx context.Context, value account.Credential, materialFailures *credentialMaterialFailureTracker, ignoreCooldown bool) (*accountLease, error) {
 	_, _, _, capacityWait := s.routingConfig()
 	deadline := time.Now().Add(capacityWait)
 	for {
-		lease, err := s.claimAccountSlotTracked(ctx, value, materialFailures)
+		lease, err := s.claimAccountSlotTrackedWithCooldown(ctx, value, materialFailures, ignoreCooldown)
 		if err != nil || lease != nil {
 			return lease, err
 		}
