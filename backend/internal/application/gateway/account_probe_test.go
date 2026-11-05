@@ -159,27 +159,33 @@ func TestProbeStreamMarkersDecideVerdict(t *testing.T) {
 	}
 }
 
-// TestThinkingEvidenceRequiresPlaintextOrFloor pins how the two reasoning traces
-// combine. A degraded account can still attach a short encrypted signature, so a
-// non-zero encrypted length alone must not count as thinking.
-func TestThinkingEvidenceRequiresPlaintextOrFloor(t *testing.T) {
+// TestThinkingEvidenceScalesWithClaimedReasoning pins the proportional rule.
+// A degraded account reports many reasoning tokens while shipping a small
+// encrypted stub, so the bar is max(256, reasoningTokens*4); a fixed floor let
+// every stub through.
+func TestThinkingEvidenceScalesWithClaimedReasoning(t *testing.T) {
 	cases := []struct {
 		name           string
 		deltaBytes     int
 		encryptedBytes int
+		reasoningToks  int64
 		wantThinking   bool
 	}{
-		{"plaintext delta alone is conclusive", 40, 0, true},
-		{"large encrypted payload counts", 0, 4096, true},
-		{"encrypted at the floor counts", 0, accountProbeMinEncryptedBytes, true},
-		{"short encrypted signature does not", 0, 120, false},
-		{"start stub with nothing else does not", 0, 0, false},
+		{"plaintext delta alone is conclusive", 40, 0, 0, true},
+		{"plaintext wins even with a tiny blob", 40, 10, 2000, true},
+		{"no trace at all", 0, 0, 500, false},
+		{"stub far below its own claim", 0, 1719, 897, false},
+		{"stub below scaled floor", 0, 3030, 1743, false},
+		{"payload meeting the scaled floor", 0, 8000, 2000, true},
+		{"small claim only needs the minimum", 0, 300, 10, true},
+		{"payload under the minimum", 0, 120, 0, false},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
-			hasThinking := testCase.deltaBytes > 0 || testCase.encryptedBytes >= accountProbeMinEncryptedBytes
+			floor := encryptedThinkingFloor(accountProbeMinEncryptedBytes, accountProbeEncryptedBytesPerToken, testCase.reasoningToks)
+			hasThinking := testCase.deltaBytes > 0 || int64(testCase.encryptedBytes) >= floor
 			if hasThinking != testCase.wantThinking {
-				t.Fatalf("hasThinking = %v, want %v", hasThinking, testCase.wantThinking)
+				t.Fatalf("hasThinking = %v, want %v (floor %d, encrypted %d)", hasThinking, testCase.wantThinking, floor, testCase.encryptedBytes)
 			}
 		})
 	}

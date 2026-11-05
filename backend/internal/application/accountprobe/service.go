@@ -154,6 +154,7 @@ type ProbeResult struct {
 	ReasoningBytes      int
 	ReasoningDeltaBytes int
 	EncryptedBytes      int
+	EncryptionFloor     int64
 	OutputTokens        int64
 	ReasoningTokens     int64
 	VisibleChars        int
@@ -220,6 +221,7 @@ type ResultView struct {
 	ReasoningBytes      int       `json:"reasoningBytes"`
 	ReasoningDeltaBytes int       `json:"reasoningDeltaBytes"`
 	EncryptedBytes      int       `json:"encryptedBytes"`
+	EncryptionFloor     int64     `json:"encryptionFloor"`
 	OutputTokens        int64     `json:"outputTokens"`
 	ReasoningTokens     int64     `json:"reasoningTokens"`
 	VisibleChars        int       `json:"visibleChars"`
@@ -655,7 +657,8 @@ func (s *Service) probeOne(ctx context.Context, runID string, cfg Config, accoun
 			Verdict: result.Verdict, Reason: result.Reason, StatusCode: result.StatusCode,
 			HasThinking: result.HasThinking, ReasoningBytes: result.ReasoningBytes,
 			ReasoningDeltaBytes: result.ReasoningDeltaBytes, EncryptedBytes: result.EncryptedBytes,
-			OutputTokens: result.OutputTokens, ReasoningTokens: result.ReasoningTokens,
+			EncryptionFloor: result.EncryptionFloor,
+			OutputTokens:    result.OutputTokens, ReasoningTokens: result.ReasoningTokens,
 			VisibleChars: result.VisibleChars, FirstTokenMS: result.FirstTokenMS,
 			DurationMS: result.DurationMS, OutputTPS: result.OutputTPS,
 			EgressNodeID: result.EgressNodeID, EgressNodeName: result.EgressNodeName,

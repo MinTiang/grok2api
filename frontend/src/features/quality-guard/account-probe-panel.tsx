@@ -447,9 +447,11 @@ export function AccountProbePanel({ accountIds }: { accountIds?: number[] } = {}
                     {/* Show where the evidence came from: a plaintext delta is
                         conclusive, an encrypted blob only counts above the floor. */}
                     <div className="text-xs text-muted-foreground">
+                      {/* Concatenated rather than interpolated: this project has no
+                          i18n resource files and t() takes a plain default string. */}
                       {item.reasoningDeltaBytes > 0
-                        ? t("accountProbe.reasoningPlain", "明文 {n}", { n: item.reasoningDeltaBytes })
-                        : t("accountProbe.reasoningEncrypted", "加密 {n}", { n: item.encryptedBytes })}
+                        ? `${t("accountProbe.reasoningPlain", "明文")} ${item.reasoningDeltaBytes}`
+                        : `${t("accountProbe.reasoningEncrypted", "加密")} ${item.encryptedBytes} / ${item.encryptionFloor}`}
                     </div>
                   </TableCell>
                   <TableCell className="tabular-nums">{item.outputTokens}</TableCell>

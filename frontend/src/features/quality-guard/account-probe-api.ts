@@ -45,8 +45,10 @@ export type AccountProbeResult = {
   reasoningBytes: number;
   /** Plaintext reasoning delta bytes; conclusive proof of thinking. */
   reasoningDeltaBytes: number;
-  /** Encrypted-reasoning payload length; only counts above the server floor. */
+  /** Encrypted-reasoning payload length; only counts above the scaled floor. */
   encryptedBytes: number;
+  /** Encrypted length this reply had to reach, from its own reasoning tokens. */
+  encryptionFloor: number;
   outputTokens: number;
   reasoningTokens: number;
   visibleChars: number;
@@ -96,6 +98,7 @@ const resultShape = hasShape({
   reasoningBytes: isNumber,
   reasoningDeltaBytes: isNumber,
   encryptedBytes: isNumber,
+  encryptionFloor: isNumber,
   outputTokens: isNumber,
   reasoningTokens: isNumber,
   visibleChars: isNumber,

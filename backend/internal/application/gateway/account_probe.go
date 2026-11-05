@@ -69,21 +69,25 @@ type AccountProbeResult struct {
 	// EncryptedBytes the encrypted-reasoning payload length. They are kept apart
 	// because a degraded account can still ship an encrypted blob: the floor on
 	// the encrypted side is what separates a real trace from a stub.
-	ReasoningDeltaBytes int       `json:"reasoningDeltaBytes"`
-	EncryptedBytes      int       `json:"encryptedBytes"`
-	OutputTokens        int64     `json:"outputTokens"`
-	ReasoningTokens     int64     `json:"reasoningTokens"`
-	VisibleChars        int       `json:"visibleChars"`
-	FirstTokenMS        int64     `json:"firstTokenMs"`
-	DurationMS          int64     `json:"durationMs"`
-	GenerationMS        int64     `json:"generationMs"`
-	OutputTPS           float64   `json:"outputTps"`
-	EgressNodeID        uint64    `json:"egressNodeId"`
-	EgressNodeName      string    `json:"egressNodeName"`
-	EarlyStop           bool      `json:"earlyStop"`
-	Model               string    `json:"model"`
-	Error               string    `json:"error,omitempty"`
-	ProbedAt            time.Time `json:"probedAt"`
+	ReasoningDeltaBytes int `json:"reasoningDeltaBytes"`
+	EncryptedBytes      int `json:"encryptedBytes"`
+	// EncryptionFloor is the encrypted length this reply had to reach, derived
+	// from its own claimed reasoning tokens. Surfacing it makes a rejection
+	// explainable instead of a bare verdict.
+	EncryptionFloor int64     `json:"encryptionFloor"`
+	OutputTokens    int64     `json:"outputTokens"`
+	ReasoningTokens int64     `json:"reasoningTokens"`
+	VisibleChars    int       `json:"visibleChars"`
+	FirstTokenMS    int64     `json:"firstTokenMs"`
+	DurationMS      int64     `json:"durationMs"`
+	GenerationMS    int64     `json:"generationMs"`
+	OutputTPS       float64   `json:"outputTps"`
+	EgressNodeID    uint64    `json:"egressNodeId"`
+	EgressNodeName  string    `json:"egressNodeName"`
+	EarlyStop       bool      `json:"earlyStop"`
+	Model           string    `json:"model"`
+	Error           string    `json:"error,omitempty"`
+	ProbedAt        time.Time `json:"probedAt"`
 }
 
 // ProbeAccount runs one short streamed chat against a single pinned account.
@@ -300,13 +304,17 @@ func (s *Service) ProbeAccount(ctx context.Context, input AccountProbeInput) (Ac
 
 	completedAt := time.Now()
 	// Plaintext reasoning deltas are conclusive. When the converter sends only
-	// encrypted reasoning, its payload length stands in, but only above a floor:
-	// a degraded account can still attach a short signature blob, so a bare
-	// non-zero length proves nothing. usage.reasoning_tokens never decides.
+	// encrypted reasoning, the payload has to be proportional to the reasoning
+	// tokens the reply claims: a degraded account reports hundreds of thinking
+	// tokens while shipping a stub of a few hundred bytes, so no fixed floor can
+	// separate the two. usage.reasoning_tokens still never decides on its own, it
+	// only sets the bar encrypted content has to clear.
 	result.ReasoningDeltaBytes = reasoningDeltaBytes
 	result.EncryptedBytes = encryptedBytes
-	result.HasThinking = reasoningDeltaBytes > 0 || encryptedBytes >= accountProbeMinEncryptedBytes
 	result.ReasoningBytes = max(reasoningDeltaBytes, encryptedBytes)
+	encryptionFloor := encryptedThinkingFloor(accountProbeMinEncryptedBytes, accountProbeEncryptedBytesPerToken, usage.ReasoningTokens)
+	result.EncryptionFloor = encryptionFloor
+	result.HasThinking = reasoningDeltaBytes > 0 || int64(encryptedBytes) >= encryptionFloor
 	result.OutputTokens = usage.OutputTokens
 	result.ReasoningTokens = usage.ReasoningTokens
 	result.VisibleChars = len(visible.String())
@@ -391,10 +399,10 @@ const (
 	// Anything below this is treated as unset: reasoning needs room to stream
 	// before the visible answer starts.
 	accountProbeMinOutputTokens = 128
-	// Encrypted reasoning must reach this size to count as proof. The request-path
-	// classifier uses the same floor for the same reason: a signature blob is
-	// shipped by degraded accounts as well.
-	accountProbeMinEncryptedBytes = 256
+	// Encrypted reasoning must scale with the reasoning tokens the reply claims,
+	// or it is a stub. These mirror the request-path classifier's defaults.
+	accountProbeMinEncryptedBytes      = 256
+	accountProbeEncryptedBytesPerToken = 4
 )
 
 // IsAccountProbePenalizable reports whether a verdict should cool the account.
