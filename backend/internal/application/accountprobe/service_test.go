@@ -173,3 +173,63 @@ func TestPersistedFalseIsNotTreatedAsUnset(t *testing.T) {
 		t.Fatal("explicit false must override the default")
 	}
 }
+
+// TestRatioSummaryCalibration pins what the self-check reports. The threshold is
+// coupled to the prompt, so this is what tells an operator the two bands still
+// separate - or that they have collapsed and the number is meaningless.
+func TestRatioSummaryCalibration(t *testing.T) {
+	build := func(threshold float64, ratios ...float64) *Service {
+		s := &Service{cfg: normalizeConfig(Config{RatioThreshold: threshold})}
+		for _, ratio := range ratios {
+			s.recent = append(s.recent, ResultView{ReasoningRatio: ratio, Verdict: VerdictHealthy})
+		}
+		return s
+	}
+
+	t.Run("separated bands recommend the midpoint", func(t *testing.T) {
+		s := build(3.8, 1.97, 2.03, 2.16, 2.33, 5.00, 5.07, 5.11, 5.54)
+		got := s.RatioSummary()
+		if !got.Calibrated {
+			t.Fatalf("expected calibrated, got warning %q", got.Warning)
+		}
+		if got.Degraded != 4 || got.Healthy != 4 {
+			t.Fatalf("counts = %d/%d, want 4/4", got.Degraded, got.Healthy)
+		}
+		if got.DegradedMax != 2.33 || got.HealthyMin != 5 {
+			t.Fatalf("edges = %v/%v, want 2.33/5", got.DegradedMax, got.HealthyMin)
+		}
+		if got.Recommended != 3.67 {
+			t.Fatalf("recommended = %v, want 3.67", got.Recommended)
+		}
+	})
+
+	t.Run("overlapping bands warn instead of pretending", func(t *testing.T) {
+		s := build(3.0, 2.9, 2.95, 3.0, 3.05, 3.1, 3.2)
+		got := s.RatioSummary()
+		if got.Calibrated {
+			t.Fatal("expected overlap to be reported as uncalibrated")
+		}
+		if got.Warning == "" {
+			t.Fatal("expected a warning when the bands overlap")
+		}
+	})
+
+	t.Run("too few samples is not a calibration", func(t *testing.T) {
+		s := build(3.0, 1.8, 5.0)
+		got := s.RatioSummary()
+		if got.Calibrated {
+			t.Fatal("two rows are not enough to calibrate")
+		}
+		if got.Samples != 2 {
+			t.Fatalf("samples = %d, want 2", got.Samples)
+		}
+	})
+
+	t.Run("threshold far from the gap is flagged", func(t *testing.T) {
+		s := build(3.0, 1.97, 2.03, 2.16, 5, 5.07, 5.11)
+		got := s.RatioSummary()
+		if !got.Calibrated || got.Warning == "" {
+			t.Fatalf("expected a nudging warning, got calibrated=%v warning=%q", got.Calibrated, got.Warning)
+		}
+	})
+}

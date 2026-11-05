@@ -94,10 +94,27 @@ export type AccountProbeRun = {
   results: AccountProbeResult[];
 };
 
+/**
+ * Self-check on whether the configured threshold still separates the fleet. The
+ * threshold tracks the prompt, so this is what tells an operator it went stale.
+ */
+export type AccountProbeCalibration = {
+  samples: number;
+  degraded: number;
+  healthy: number;
+  degradedMax: number;
+  healthyMin: number;
+  recommended: number;
+  threshold: number;
+  calibrated: boolean;
+  warning?: string;
+};
+
 export type AccountProbeStatus = {
   config: AccountProbeConfig;
   recent: AccountProbeResult[];
   runs: AccountProbeRun[];
+  calibration: AccountProbeCalibration;
 };
 
 const resultShape = hasShape({
@@ -167,10 +184,23 @@ const configShape = hasShape({
 // createObjectDecoder does not type-check.
 const runDecoder = createValidatedDecoder<AccountProbeRun>("accountProbeRun", runShape);
 
+const calibrationShape = hasShape({
+  samples: isNumber,
+  degraded: isNumber,
+  healthy: isNumber,
+  degradedMax: isNumber,
+  healthyMin: isNumber,
+  recommended: isNumber,
+  threshold: isNumber,
+  calibrated: isBoolean,
+  warning: isOptional(isString),
+});
+
 const statusDecoder = createObjectDecoder<AccountProbeStatus>("accountProbeStatus", {
   config: configShape,
   recent: isArrayOf(resultShape),
   runs: isArrayOf(runShape),
+  calibration: calibrationShape,
 });
 
 export async function fetchAccountProbeStatus(): Promise<AccountProbeStatus> {

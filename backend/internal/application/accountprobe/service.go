@@ -11,7 +11,9 @@ package accountprobe
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"math"
 	"runtime/debug"
 	"sync"
 	"time"
@@ -1008,6 +1010,89 @@ func (s *Service) RecentResults() []ResultView {
 	values := make([]ResultView, len(s.recent))
 	copy(values, s.recent)
 	return values
+}
+
+// RatioSummary describes how well the current threshold separates the accounts
+// that have actually been measured.
+//
+// The threshold is coupled to the prompt, so it goes stale whenever the prompt,
+// the model or the upstream changes. Rather than asking an operator to eyeball
+// the table, the probe summarises its own recent results: if the two bands still
+// leave a gap, the recommended value sits in the middle of it.
+type RatioSummary struct {
+	Samples     int     `json:"samples"`
+	Degraded    int     `json:"degraded"`
+	Healthy     int     `json:"healthy"`
+	DegradedMax float64 `json:"degradedMax"`
+	HealthyMin  float64 `json:"healthyMin"`
+	Recommended float64 `json:"recommended"`
+	Threshold   float64 `json:"threshold"`
+	Calibrated  bool    `json:"calibrated"`
+	Warning     string  `json:"warning,omitempty"`
+}
+
+// minCalibrationSamples is how many rows a band needs before its edge is trusted.
+const minCalibrationSamples = 3
+
+// minCalibrationGap is the separation below which the bands are treated as
+// overlapping. Measured gaps are 2.3x and above; anything under half a byte per
+// token means the threshold is no longer separating anything real.
+const minCalibrationGap = 0.5
+
+// RatioSummary reports the separation the current threshold is achieving.
+func (s *Service) RatioSummary() RatioSummary {
+	s.mu.RLock()
+	values := make([]ResultView, len(s.recent))
+	copy(values, s.recent)
+	s.mu.RUnlock()
+
+	threshold := s.Config().RatioThreshold
+	if threshold <= 0 {
+		threshold = accountProbeDefaultRatio
+	}
+	summary := RatioSummary{Threshold: threshold}
+
+	degradedMax := 0.0
+	healthyMin := 0.0
+	for _, value := range values {
+		ratio := value.ReasoningRatio
+		if ratio <= 0 {
+			continue
+		}
+		summary.Samples++
+		if ratio < threshold {
+			summary.Degraded++
+			if ratio > degradedMax {
+				degradedMax = ratio
+			}
+			continue
+		}
+		summary.Healthy++
+		if healthyMin == 0 || ratio < healthyMin {
+			healthyMin = ratio
+		}
+	}
+	summary.DegradedMax = round2(degradedMax)
+	summary.HealthyMin = round2(healthyMin)
+
+	switch {
+	case summary.Degraded < minCalibrationSamples || summary.Healthy < minCalibrationSamples:
+		summary.Warning = "样本不足，至少需要两组各 3 条才建议标定"
+	case healthyMin-degradedMax < minCalibrationGap:
+		summary.Warning = "两组比值重叠，当前阈值已无法区分；请更换题目或模型后重新标定"
+	default:
+		summary.Calibrated = true
+		summary.Recommended = round2((degradedMax + healthyMin) / 2)
+		if math.Abs(summary.Recommended-threshold) > 0.5 {
+			summary.Warning = fmt.Sprintf("建议把阈值调整为 %.2f", summary.Recommended)
+		}
+	}
+	return summary
+}
+
+// round2 keeps ratio figures at two decimals for display and comparison.
+func round2(value float64) float64 {
+	return math.Round(value*100) / 100
 }
 
 // Stop cancels a running batch.

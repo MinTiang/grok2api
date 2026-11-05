@@ -332,6 +332,42 @@ export function AccountProbePanel({ accountIds }: { accountIds?: number[] } = {}
         ) : null}
       </div>
 
+      {/* The threshold is coupled to the prompt, so the probe checks its own
+          recent results and says whether the two bands still separate. */}
+      {query.data?.calibration ? (
+        <div
+          className={cn(
+            "rounded-xl border px-4 py-3 text-xs",
+            query.data.calibration.calibrated
+              ? "bg-muted/40 text-muted-foreground"
+              : "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-400",
+          )}
+        >
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+            <span className="font-medium">
+              {t("accountProbe.calibration", "判据标定")}
+            </span>
+            <span>
+              {`${t("accountProbe.calibrationSamples", "样本")} ${query.data.calibration.samples}`}
+            </span>
+            <span>
+              {`${t("accountProbe.calibrationBands", "降智上限 / 健康下限")} ${query.data.calibration.degradedMax} / ${query.data.calibration.healthyMin}`}
+            </span>
+            <span>
+              {`${t("accountProbe.calibrationCurrent", "当前阈值")} ${query.data.calibration.threshold}`}
+            </span>
+            {query.data.calibration.recommended > 0 ? (
+              <span>
+                {`${t("accountProbe.calibrationRecommended", "建议")} ${query.data.calibration.recommended}`}
+              </span>
+            ) : null}
+          </div>
+          {query.data.calibration.warning ? (
+            <div className="mt-1">{query.data.calibration.warning}</div>
+          ) : null}
+        </div>
+      ) : null}
+
       {accountIds?.length ? null : (
         <div className="rounded-xl border bg-card">
           <div className="flex flex-wrap items-center justify-between gap-3 border-b px-4 py-3">

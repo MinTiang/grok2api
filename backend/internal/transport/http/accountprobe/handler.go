@@ -77,8 +77,9 @@ func (h *Handler) status(c *gin.Context) {
 			"cooldownHours":       int(cfg.Cooldown / time.Hour),
 			"autoDisable":         cfg.AutoDisable,
 		},
-		"recent": h.service.RecentResults(),
-		"runs":   h.service.Runs(),
+		"recent":      h.service.RecentResults(),
+		"calibration": h.service.RatioSummary(),
+		"runs":        h.service.Runs(),
 	}})
 }
 
