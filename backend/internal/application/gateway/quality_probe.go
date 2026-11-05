@@ -25,6 +25,18 @@ import (
 
 const qualityProbeMaxStreamBytes = 4 << 20
 
+// qualityProbeToolCall is one streamed tool invocation. Arguments arrive as
+// fragments keyed by Index, so callers concatenate them per index.
+type qualityProbeToolCall struct {
+	Index    int    `json:"index"`
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
 type qualityProbeChatEvent struct {
 	ID      string `json:"id"`
 	Model   string `json:"model"`
@@ -34,7 +46,12 @@ type qualityProbeChatEvent struct {
 			Reasoning        string `json:"reasoning"`
 			ReasoningContent string `json:"reasoning_content"`
 			ThinkingContent  string `json:"thinking_content"`
+			// ToolCalls carries the streamed tool invocation. The account probe
+			// judges capability from this: a degraded account answers in prose
+			// instead of calling the tool it was told to call.
+			ToolCalls []qualityProbeToolCall `json:"tool_calls"`
 		} `json:"delta"`
+		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 	Usage *struct {
 		PromptTokens            int64 `json:"prompt_tokens"`

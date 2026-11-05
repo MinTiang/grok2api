@@ -37,6 +37,14 @@ const accountProbeMaxStreamBytes = 1 << 20
 // and enabling the probe later would otherwise leave it switched off.
 var ErrAccountProbeKeyUnavailable = errors.New("短测 Client Key 已禁用或过期")
 
+// Account probe modes. They judge different capabilities and never overlap:
+// tool mode asks whether the account can actually call a function, thinking mode
+// asks whether the reply carried a real reasoning trace.
+const (
+	AccountProbeModeTool     = "tool"
+	AccountProbeModeThinking = "thinking"
+)
+
 // AccountProbeInput describes one manual or scheduled account quality probe.
 type AccountProbeInput struct {
 	AccountID uint64
@@ -46,6 +54,8 @@ type AccountProbeInput struct {
 	Model           string
 	Prompt          string
 	MaxOutputTokens int
+	// Mode selects the capability under test. Empty means tool mode.
+	Mode string
 	// EarlyStopOnThinking stops reading as soon as reasoning evidence arrives.
 	// It is kept because the wire format allows it, but on Build it never fires:
 	// the encrypted-reasoning marker is emitted at the tail of the stream, after
@@ -77,6 +87,12 @@ type AccountProbeResult struct {
 	// measured on real accounts, degraded ones delay their answer just as long as
 	// healthy ones, so it cannot decide a verdict.
 	FirstVisibleMS int64 `json:"firstVisibleMs"`
+	// Tool mode outcome. ToolCallOK is the verdict signal: the model either invoked
+	// the tool with complete arguments or it did not.
+	Mode       string `json:"mode,omitempty"`
+	ToolCallOK bool   `json:"toolCallOk"`
+	ToolName   string `json:"toolName,omitempty"`
+	ToolArgs   string `json:"toolArgs,omitempty"`
 	// EncryptionFloor is the encrypted length this reply had to reach, derived
 	// from its own claimed reasoning tokens. Surfacing it makes a rejection
 	// explainable instead of a bare verdict.
@@ -126,9 +142,14 @@ func (s *Service) ProbeAccount(ctx context.Context, input AccountProbeInput) (Ac
 		return result, nil
 	}
 
+	mode := normalizeAccountProbeMode(input.Mode)
 	prompt := strings.TrimSpace(input.Prompt)
 	if prompt == "" {
-		prompt = defaultAccountProbePrompt
+		if mode == AccountProbeModeTool {
+			prompt = accountProbeToolPrompt
+		} else {
+			prompt = defaultAccountProbePrompt
+		}
 	}
 	maxOutput := input.MaxOutputTokens
 	// Reasoning draws from this budget, so a tiny cap would end the reply before
@@ -138,13 +159,23 @@ func (s *Service) ProbeAccount(ctx context.Context, input AccountProbeInput) (Ac
 		maxOutput = defaultAccountProbeMaxOutputTokens
 	}
 
-	body, err := json.Marshal(map[string]any{
-		"model":          input.Model,
-		"messages":       []map[string]string{{"role": "user", "content": prompt}},
-		"stream":         true,
+	payload := map[string]any{
+		"model":    input.Model,
+		"messages": []map[string]string{{"role": "user", "content": prompt}},
+		// The body flag has to agree with the Streaming option below: Build answers
+		// a streamed request with SSE, which cannot be decoded as one JSON object.
+		"stream":         mode != AccountProbeModeTool,
 		"stream_options": map[string]bool{"include_usage": true},
 		"max_tokens":     maxOutput,
-	})
+	}
+	if mode == AccountProbeModeTool {
+		// "required" is what makes the test meaningful: with "auto" a degraded
+		// account answers in prose and a healthy one may also skip the call, so
+		// only a forced call separates capability from choice.
+		payload["tools"] = accountProbeTools()
+		payload["tool_choice"] = "required"
+	}
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return result, err
 	}
@@ -178,8 +209,12 @@ func (s *Service) ProbeAccount(ctx context.Context, input AccountProbeInput) (Ac
 	startedAt := time.Now()
 	answer, err := s.CreateChatCompletion(probeCtx, Input{
 		RequestID: "probe_" + requestIDPart, ClientKey: key, PublicModel: publicModel, Body: body,
-		Streaming: true, Operation: audit.OperationChat, ForcedAccountID: input.AccountID,
-		accountProbe: true,
+		// Tool mode is not streamed: measured on Build, a streamed tools request
+		// yields no tool_calls at all, so the call is only observable in a complete
+		// response. Thinking mode keeps streaming because its evidence arrives as
+		// SSE comments.
+		Streaming: mode != AccountProbeModeTool, Operation: audit.OperationChat,
+		ForcedAccountID: input.AccountID, accountProbe: true,
 	})
 	if err != nil {
 		result.Verdict = AccountProbeError
@@ -213,6 +248,18 @@ func (s *Service) ProbeAccount(ctx context.Context, input AccountProbeInput) (Ac
 	}
 	result.StatusCode = answer.StatusCode
 
+	if mode == AccountProbeModeTool {
+		payload, readErr := io.ReadAll(io.LimitReader(answer.Body, accountProbeMaxStreamBytes))
+		result.DurationMS = time.Since(startedAt).Milliseconds()
+		if readErr != nil {
+			result.Verdict = AccountProbeError
+			result.Reason = "read_failed"
+			result.Error = readErr.Error()
+			return result, nil
+		}
+		return parseAccountProbeToolBody(result, payload), nil
+	}
+
 	var firstGeneratedAt time.Time
 	var firstReasoningAt time.Time
 	var visible strings.Builder
@@ -222,6 +269,11 @@ func (s *Service) ProbeAccount(ctx context.Context, input AccountProbeInput) (Ac
 	// FirstVisibleMS is recorded for diagnostics only. Measurement across real
 	// accounts showed degraded ones hold their answer back just as long as healthy
 	// ones, so this delay cannot decide a verdict and nothing stops early on it.
+	// Tool mode needs these: the call arrives as fragments and its arguments are
+	// what tell a real invocation from prose that merely mentions the tool.
+	var toolName string
+	var toolArgs strings.Builder
+	toolComplete := false
 	totalBytes := 0
 	earlyStop := false
 	earlyStopDelay := time.Duration(input.EarlyStopDelayMS) * time.Millisecond
@@ -306,6 +358,25 @@ func (s *Service) ProbeAccount(ctx context.Context, input AccountProbeInput) (Ac
 					answer.MarkFirstToken()
 				}
 			}
+			// Tool mode: accumulate the invocation. Arguments stream in fragments,
+			// so completeness is checked as they arrive.
+			for _, call := range delta.ToolCalls {
+				if call.Function.Name != "" {
+					toolName = call.Function.Name
+				}
+				if call.Function.Arguments != "" {
+					toolArgs.WriteString(call.Function.Arguments)
+				}
+			}
+			if mode == AccountProbeModeTool && !toolComplete && toolName != "" {
+				toolComplete = accountProbeToolCallComplete(toolName, toolArgs.String())
+			}
+		}
+		// Tool mode decides as soon as the call is complete: the capability under
+		// test is proven, and the rest of the stream is pure cost.
+		if mode == AccountProbeModeTool && toolComplete {
+			earlyStop = true
+			break
 		}
 		// Fallback for a reply that only streams reasoning: wait for the delay
 		// after reasoning appears so a partially streamed thought is not judged.
@@ -347,8 +418,34 @@ func (s *Service) ProbeAccount(ctx context.Context, input AccountProbeInput) (Ac
 		result.OutputTPS = qualityProbeOutputTokensPerSecond(usage.OutputTokens, usage.ReasoningTokens, result.DurationMS, result.FirstTokenMS)
 	}
 
-	// The verdict comes from the completed reply: the only signal that separates a
-	// real trace from a stub is the encrypted payload measured against the
+	result.Mode = mode
+	result.ToolCallOK = toolComplete
+	result.ToolName = toolName
+	result.ToolArgs = toolArgs.String()
+
+	if mode == AccountProbeModeTool {
+		// Tool mode judges one thing: did a forced call actually happen with usable
+		// arguments. That is a capability signal, not a reasoning-volume estimate,
+		// and it is available the moment the call lands.
+		switch {
+		case toolComplete:
+			result.Verdict = AccountProbeHealthy
+			result.Reason = "tool_call_ok"
+		case toolName == "" && len(visible.String()) == 0 && usage.OutputTokens == 0:
+			result.Verdict = AccountProbeError
+			result.Reason = "empty_reply"
+		case toolName == "":
+			result.Verdict = AccountProbeHard
+			result.Reason = "tool_call_missing"
+		default:
+			result.Verdict = AccountProbeHard
+			result.Reason = "tool_call_incomplete"
+		}
+		return result, nil
+	}
+
+	// Thinking mode comes from the completed reply: the only signal that separates
+	// a real trace from a stub is the encrypted payload measured against the
 	// reasoning tokens the reply claims, and both arrive at the tail.
 	result.Verdict, result.Reason = classifyAccountProbeResult(result)
 	return result, nil
@@ -431,7 +528,124 @@ const (
 	// only verdict signal available while the stream is still open, so the probe
 	// can decide and stop instead of paying for the whole reply.
 	accountProbeThinkingThreshold = 3 * time.Second
+	// accountProbeToolName is the single function the tool-mode probe asks for.
+	accountProbeToolName = "get_weather"
+	// accountProbeToolPrompt names the expected arguments so the probe can check
+	// the call itself, not merely that some call happened.
+	accountProbeToolPrompt = "What is the weather in Tokyo right now? Call the get_weather tool with city=Tokyo and unit=celsius."
 )
+
+// accountProbeTools is the tool schema the tool-mode probe offers. It is fixed so
+// every account is asked the same question and the calls are comparable.
+func accountProbeTools() []map[string]any {
+	return []map[string]any{{
+		"type": "function",
+		"function": map[string]any{
+			"name":        accountProbeToolName,
+			"description": "Get the current weather for a city",
+			"parameters": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"city": map[string]any{"type": "string", "description": "City name"},
+					"unit": map[string]any{
+						"type": "string",
+						"enum": []string{"celsius", "fahrenheit"},
+					},
+				},
+				"required": []string{"city", "unit"},
+			},
+		},
+	}}
+}
+
+// accountProbeToolCallComplete reports whether the model actually invoked the
+// probe tool with both required arguments. A prose answer, or a call whose
+// arguments are missing or malformed, is what a degraded account produces.
+func accountProbeToolCallComplete(name, args string) bool {
+	if name != accountProbeToolName {
+		return false
+	}
+	var parsed map[string]any
+	if json.Unmarshal([]byte(args), &parsed) != nil {
+		return false
+	}
+	city, hasCity := parsed["city"].(string)
+	unit, hasUnit := parsed["unit"].(string)
+	return hasCity && hasUnit && strings.TrimSpace(city) != "" && strings.TrimSpace(unit) != ""
+}
+
+// parseAccountProbeToolBody turns a complete Chat Completions response into a
+// tool-mode verdict. Arguments are concatenated per index because the wire format
+// splits them, and completeness is what separates a real call from prose.
+func parseAccountProbeToolBody(result AccountProbeResult, payload []byte) AccountProbeResult {
+	result.Mode = AccountProbeModeTool
+	var response struct {
+		Choices []struct {
+			FinishReason string `json:"finish_reason"`
+			Message      struct {
+				Content   string                 `json:"content"`
+				ToolCalls []qualityProbeToolCall `json:"tool_calls"`
+			} `json:"message"`
+		} `json:"choices"`
+		Usage *struct {
+			CompletionTokens        int64 `json:"completion_tokens"`
+			CompletionTokensDetails struct {
+				ReasoningTokens int64 `json:"reasoning_tokens"`
+			} `json:"completion_tokens_details"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(payload, &response); err != nil {
+		result.Verdict = AccountProbeError
+		result.Reason = "invalid_response"
+		result.Error = "短测响应不是合法 JSON"
+		return result
+	}
+	if len(response.Choices) == 0 {
+		result.Verdict = AccountProbeError
+		result.Reason = "empty_reply"
+		return result
+	}
+	choice := response.Choices[0]
+	var name string
+	var args strings.Builder
+	for _, call := range choice.Message.ToolCalls {
+		if call.Function.Name != "" {
+			name = call.Function.Name
+		}
+		args.WriteString(call.Function.Arguments)
+	}
+	result.ToolName = name
+	result.ToolArgs = args.String()
+	result.ToolCallOK = accountProbeToolCallComplete(name, args.String())
+	result.VisibleChars = len(choice.Message.Content)
+	if response.Usage != nil {
+		result.OutputTokens = response.Usage.CompletionTokens
+		result.ReasoningTokens = response.Usage.CompletionTokensDetails.ReasoningTokens
+	}
+	switch {
+	case result.ToolCallOK:
+		result.Verdict = AccountProbeHealthy
+		result.Reason = "tool_call_ok"
+	case name == "" && result.VisibleChars == 0 && result.OutputTokens == 0:
+		result.Verdict = AccountProbeError
+		result.Reason = "empty_reply"
+	case name == "":
+		result.Verdict = AccountProbeHard
+		result.Reason = "tool_call_missing"
+	default:
+		result.Verdict = AccountProbeHard
+		result.Reason = "tool_call_incomplete"
+	}
+	return result
+}
+
+// normalizeAccountProbeMode keeps an unknown or empty mode on the tool default.
+func normalizeAccountProbeMode(value string) string {
+	if strings.TrimSpace(value) == AccountProbeModeThinking {
+		return AccountProbeModeThinking
+	}
+	return AccountProbeModeTool
+}
 
 // IsAccountProbePenalizable reports whether a verdict should cool the account.
 // Transport and upstream failures are infrastructure noise and never penalize

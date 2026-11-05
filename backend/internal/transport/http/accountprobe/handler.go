@@ -44,6 +44,7 @@ type configRequest struct {
 	ChunkSize           *int    `json:"chunkSize"`
 	Workers             *int    `json:"workers"`
 	Model               *string `json:"model"`
+	Mode                *string `json:"mode"`
 	Prompt              *string `json:"prompt"`
 	MaxOutputTokens     *int    `json:"maxOutputTokens"`
 	EarlyStopOnThinking *bool   `json:"earlyStopOnThinking"`
@@ -65,6 +66,7 @@ func (h *Handler) status(c *gin.Context) {
 			"chunkSize":           cfg.ChunkSize,
 			"workers":             cfg.Workers,
 			"model":               cfg.Model,
+			"mode":                cfg.Mode,
 			"prompt":              cfg.Prompt,
 			"maxOutputTokens":     cfg.MaxOutputTokens,
 			"clientKeyId":         cfg.ClientKeyID,
@@ -102,6 +104,14 @@ func (h *Handler) updateConfig(c *gin.Context) {
 	if request.Model != nil {
 		trimmed := strings.TrimSpace(*request.Model)
 		persisted.Model = &trimmed
+	}
+	if request.Mode != nil {
+		trimmed := strings.TrimSpace(*request.Mode)
+		if trimmed != "" && trimmed != accountprobe.AccountProbeModeTool && trimmed != accountprobe.AccountProbeModeThinking {
+			c.JSON(http.StatusBadRequest, gin.H{"error": gin.H{"code": "invalidRequest", "message": "短测模式必须是 tool 或 thinking"}})
+			return
+		}
+		persisted.Mode = &trimmed
 	}
 	if request.Prompt != nil {
 		trimmed := strings.TrimSpace(*request.Prompt)

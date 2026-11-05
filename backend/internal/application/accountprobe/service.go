@@ -34,12 +34,37 @@ const (
 	defaultCooldown = 12 * time.Hour
 	// defaultModel is the Build model used when the operator leaves it empty.
 	defaultModel = "grok-4.6"
+	// defaultMode stays on thinking. Tool mode is implemented but not trustworthy yet:
+	// measured upstream honours tool_choice=required only about half the time,
+	// regardless of account quality, so its verdicts are noise.
+	// The capability the probe tests by default is:
+	// harder signal than reasoning volume: it is visible the moment the call lands.
+	defaultMode = AccountProbeModeThinking
 	// probeTimeout bounds a single account probe.
 	probeTimeout = 90 * time.Second
 	// penaltyTimeout bounds the account write that follows a degraded verdict.
 	penaltyTimeout = 10 * time.Second
 	// maxRecentResults bounds the in-memory result ring used by the panel.
 	maxRecentResults = 500
+	// accountProbeToolSamples is how many independent calls a tool-mode verdict is
+	// built from. A single sample is not trustworthy: measured on one account it
+	// returned a complete call, then prose, then a call again, because the model
+	// does not follow tool_choice=required deterministically.
+	accountProbeToolSamples = 5
+	// accountProbeToolMajority is how many of those samples must carry a complete
+	// call before the account counts as able to call tools.
+	accountProbeToolMajority = 4
+	// accountProbeToolSampleGap spaces the samples so they do not collide on the
+	// same account slot.
+	accountProbeToolSampleGap = 3 * time.Second
+)
+
+// Probe modes. They test different capabilities and are never mixed: tool mode
+// asks whether the account can actually invoke a function, thinking mode asks
+// whether the reply carried a real reasoning trace.
+const (
+	AccountProbeModeTool     = "tool"
+	AccountProbeModeThinking = "thinking"
 )
 
 // Verdicts reported by the gateway probe.
@@ -66,6 +91,7 @@ type PersistedConfig struct {
 	ChunkSize           *int    `json:"chunkSize,omitempty"`
 	Workers             *int    `json:"workers,omitempty"`
 	Model               *string `json:"model,omitempty"`
+	Mode                *string `json:"mode,omitempty"`
 	Prompt              *string `json:"prompt,omitempty"`
 	MaxOutputTokens     *int    `json:"maxOutputTokens,omitempty"`
 	EarlyStopOnThinking *bool   `json:"earlyStopOnThinking,omitempty"`
@@ -90,6 +116,9 @@ func (p PersistedConfig) Apply(cfg Config) Config {
 	}
 	if p.Model != nil && *p.Model != "" {
 		cfg.Model = *p.Model
+	}
+	if p.Mode != nil && *p.Mode != "" {
+		cfg.Mode = *p.Mode
 	}
 	if p.Prompt != nil {
 		cfg.Prompt = *p.Prompt
@@ -122,6 +151,7 @@ func FromConfig(cfg Config) PersistedConfig {
 		ChunkSize:           &cfg.ChunkSize,
 		Workers:             &cfg.Workers,
 		Model:               &cfg.Model,
+		Mode:                &cfg.Mode,
 		Prompt:              &cfg.Prompt,
 		MaxOutputTokens:     &cfg.MaxOutputTokens,
 		EarlyStopOnThinking: &cfg.EarlyStopOnThinking,
@@ -138,6 +168,7 @@ type ProbeInput struct {
 	Model               string
 	Prompt              string
 	MaxOutputTokens     int
+	Mode                string
 	EarlyStopOnThinking bool
 	EarlyStopDelayMS    int
 }
@@ -156,6 +187,10 @@ type ProbeResult struct {
 	EncryptedBytes      int
 	EncryptionFloor     int64
 	FirstVisibleMS      int64
+	Mode                string
+	ToolCallOK          bool
+	ToolName            string
+	ToolArgs            string
 	OutputTokens        int64
 	ReasoningTokens     int64
 	VisibleChars        int
@@ -201,6 +236,7 @@ type Config struct {
 	ChunkSize           int
 	Workers             int
 	Model               string
+	Mode                string
 	Prompt              string
 	MaxOutputTokens     int
 	ClientKeyID         uint64
@@ -224,6 +260,10 @@ type ResultView struct {
 	EncryptedBytes      int       `json:"encryptedBytes"`
 	EncryptionFloor     int64     `json:"encryptionFloor"`
 	FirstVisibleMS      int64     `json:"firstVisibleMs"`
+	Mode                string    `json:"mode,omitempty"`
+	ToolCallOK          bool      `json:"toolCallOk"`
+	ToolName            string    `json:"toolName,omitempty"`
+	ToolArgs            string    `json:"toolArgs,omitempty"`
 	OutputTokens        int64     `json:"outputTokens"`
 	ReasoningTokens     int64     `json:"reasoningTokens"`
 	VisibleChars        int       `json:"visibleChars"`
@@ -367,6 +407,9 @@ func normalizeConfig(value Config) Config {
 	}
 	if value.Model == "" {
 		value.Model = defaultModel
+	}
+	if value.Mode == "" {
+		value.Mode = defaultMode
 	}
 	if value.MaxOutputTokens <= 0 {
 		// Reasoning draws from the same budget as the visible answer, so this has
@@ -625,6 +668,68 @@ func (s *Service) execute(ctx context.Context, runID string, cfg Config, account
 	wg.Wait()
 }
 
+// sampleToolMode runs the probe several times and decides by majority.
+//
+// Tool mode cannot rely on a single call. Measured on one account, three
+// consecutive samples returned a complete call, then prose, then a complete call
+// again, because the model does not honour tool_choice=required deterministically.
+// Majority voting turns that noise into a stable verdict; the extra samples are
+// short requests, and the loop stops as soon as the outcome is settled.
+func (s *Service) sampleToolMode(ctx context.Context, input ProbeInput, accountID uint64) ProbeResult {
+	var best ProbeResult
+	okCount, decided := 0, 0
+	for sample := 0; sample < accountProbeToolSamples; sample++ {
+		if sample > 0 {
+			select {
+			case <-ctx.Done():
+			case <-time.After(accountProbeToolSampleGap):
+			}
+			if ctx.Err() != nil {
+				break
+			}
+		}
+		result, err := s.prober.ProbeAccount(ctx, input)
+		if err != nil {
+			s.logger.Warn("account_probe_sample_failed", "account_id", accountID, "sample", sample+1, "error", err)
+			continue
+		}
+		if result.Reason == "account_disabled" {
+			return result
+		}
+		decided++
+		if result.ToolCallOK {
+			okCount++
+			// Keep a successful sample: it carries the arguments worth showing.
+			if !best.ToolCallOK {
+				best = result
+			}
+		} else if best.Verdict == "" {
+			best = result
+		}
+		if okCount >= accountProbeToolMajority {
+			break
+		}
+		// Stop once the majority is arithmetically impossible.
+		if decided-okCount > accountProbeToolSamples-accountProbeToolMajority {
+			break
+		}
+	}
+	switch {
+	case best.Verdict == "":
+		return ProbeResult{AccountID: accountID, Verdict: VerdictError, Reason: "probe_failed", Error: "多次采样均未拿到响应"}
+	case okCount >= accountProbeToolMajority:
+		best.Verdict = VerdictHealthy
+		best.Reason = "tool_call_ok"
+		best.ToolCallOK = true
+	default:
+		best.Verdict = VerdictHard
+		best.Reason = "tool_call_missing"
+		best.ToolCallOK = false
+	}
+	s.logger.Info("account_probe_sampled", "account_id", accountID, "ok", okCount, "decided", decided, "verdict", best.Verdict)
+	return best
+}
+
 func (s *Service) probeOne(ctx context.Context, runID string, cfg Config, accountID uint64) {
 	// Keep a single bad probe from taking down its worker: the run must still
 	// report a verdict for this account and continue with the rest.
@@ -641,11 +746,18 @@ func (s *Service) probeOne(ctx context.Context, runID string, cfg Config, accoun
 	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
 
-	result, err := s.prober.ProbeAccount(probeCtx, ProbeInput{
-		AccountID: accountID, ClientKeyID: cfg.ClientKeyID, Model: cfg.Model, Prompt: cfg.Prompt,
+	input := ProbeInput{
+		AccountID: accountID, ClientKeyID: cfg.ClientKeyID, Model: cfg.Model, Mode: cfg.Mode, Prompt: cfg.Prompt,
 		MaxOutputTokens: cfg.MaxOutputTokens, EarlyStopOnThinking: cfg.EarlyStopOnThinking,
 		EarlyStopDelayMS: cfg.EarlyStopDelayMS,
-	})
+	}
+	var result ProbeResult
+	var err error
+	if cfg.Mode == AccountProbeModeTool {
+		result = s.sampleToolMode(probeCtx, input, accountID)
+	} else {
+		result, err = s.prober.ProbeAccount(probeCtx, input)
+	}
 	view := ResultView{
 		AccountID: accountID, ProbedAt: time.Now().UTC(),
 	}
@@ -661,7 +773,9 @@ func (s *Service) probeOne(ctx context.Context, runID string, cfg Config, accoun
 			ReasoningDeltaBytes: result.ReasoningDeltaBytes, EncryptedBytes: result.EncryptedBytes,
 			EncryptionFloor: result.EncryptionFloor,
 			FirstVisibleMS:  result.FirstVisibleMS,
-			OutputTokens:    result.OutputTokens, ReasoningTokens: result.ReasoningTokens,
+			Mode:            result.Mode, ToolCallOK: result.ToolCallOK,
+			ToolName: result.ToolName, ToolArgs: result.ToolArgs,
+			OutputTokens: result.OutputTokens, ReasoningTokens: result.ReasoningTokens,
 			VisibleChars: result.VisibleChars, FirstTokenMS: result.FirstTokenMS,
 			DurationMS: result.DurationMS, OutputTPS: result.OutputTPS,
 			EgressNodeID: result.EgressNodeID, EgressNodeName: result.EgressNodeName,
@@ -688,9 +802,11 @@ func (s *Service) probeOne(ctx context.Context, runID string, cfg Config, accoun
 	s.recordResult(runID, view)
 
 	s.logger.Info("account_probe_done",
-		"account_id", accountID, "verdict", view.Verdict, "has_thinking", view.HasThinking,
-		"reasoning_bytes", view.ReasoningBytes, "output_tokens", view.OutputTokens,
-		"first_visible_ms", view.FirstVisibleMS, "early_stop", view.EarlyStop, "penalized", view.Penalized)
+		"account_id", accountID, "verdict", view.Verdict, "reason", view.Reason,
+		"mode", view.Mode, "tool_call_ok", view.ToolCallOK, "tool_name", view.ToolName,
+		"has_thinking", view.HasThinking, "reasoning_bytes", view.ReasoningBytes,
+		"output_tokens", view.OutputTokens, "first_visible_ms", view.FirstVisibleMS,
+		"early_stop", view.EarlyStop, "penalized", view.Penalized)
 }
 
 // recordResult appends one probe outcome to the run counters and the recent
