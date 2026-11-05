@@ -743,6 +743,12 @@ func (s *Service) sampleThinkingMode(ctx context.Context, input ProbeInput, acco
 			lastError = result
 			continue
 		}
+		// A 401/403/429 is a definitive statement about the account, not ambiguity
+		// to average away. Counting it as healthy would quietly mark a broken
+		// account good, and counting it as degraded would penalize it for auth.
+		if result.Verdict == VerdictRisk {
+			return result
+		}
 		responded++
 		if result.Verdict == VerdictHard {
 			degraded++
@@ -815,6 +821,11 @@ func (s *Service) sampleToolMode(ctx context.Context, input ProbeInput, accountI
 		if result.Verdict == VerdictError {
 			lastError = result
 			continue
+		}
+		// Same reasoning as thinking mode: an auth verdict must not be voted on,
+		// otherwise a 403 becomes a "missing tool call" and disables the account.
+		if result.Verdict == VerdictRisk {
+			return result
 		}
 		responded++
 		if result.ToolCallOK {

@@ -233,3 +233,42 @@ func TestRatioSummaryCalibration(t *testing.T) {
 		}
 	})
 }
+
+// scriptedProber returns a fixed sequence of verdicts, then repeats the last one.
+type scriptedProber struct {
+	mu       sync.Mutex
+	verdicts []string
+	calls    int
+}
+
+func (p *scriptedProber) ProbeAccount(_ context.Context, _ ProbeInput) (ProbeResult, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	verdict := p.verdicts[len(p.verdicts)-1]
+	if p.calls < len(p.verdicts) {
+		verdict = p.verdicts[p.calls]
+	}
+	p.calls++
+	return ProbeResult{AccountID: 1, Verdict: verdict, ReasoningRatio: 4.5}, nil
+}
+
+// TestSamplingNeverTreatsRiskAsHealth is the regression guard for a 401/403 being
+// averaged into a healthy majority, which would mark a broken account good. The
+// complement matters too: in tool mode the same verdict was counted as a missing
+// call and disabled the account.
+func TestSamplingNeverTreatsRiskAsHealth(t *testing.T) {
+	s := &Service{cfg: normalizeConfig(Config{Mode: AccountProbeModeThinking})}
+	s.prober = &scriptedProber{verdicts: []string{VerdictRisk}}
+
+	got := s.sampleThinkingMode(context.Background(), ProbeInput{}, 1)
+	if got.Verdict != VerdictRisk {
+		t.Fatalf("thinking mode verdict = %q, want %q", got.Verdict, VerdictRisk)
+	}
+
+	toolService := &Service{cfg: normalizeConfig(Config{Mode: AccountProbeModeTool})}
+	toolService.prober = &scriptedProber{verdicts: []string{VerdictRisk}}
+	toolGot := toolService.sampleToolMode(context.Background(), ProbeInput{}, 1)
+	if toolGot.Verdict != VerdictRisk {
+		t.Fatalf("tool mode verdict = %q, want %q", toolGot.Verdict, VerdictRisk)
+	}
+}
