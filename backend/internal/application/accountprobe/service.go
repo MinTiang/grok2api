@@ -346,11 +346,12 @@ type Service struct {
 	recent  []ResultView
 	running bool
 	cancel  context.CancelFunc
-	// cursorPage is the next page the automatic sweep will read. It lives in
-	// memory only: a restart simply restarts the rotation, which is harmless
-	// because a full cycle is a sweep rather than a checkpointed job.
+	// cursorPage is the next page the automatic sweep will read. It is persisted
+	// through stateStore: the sweep only reaches the tail of a large pool after
+	// many cycles, so a restart that reset it would starve those accounts forever.
 	cursorPage int
 	store      *configStore
+	state      *stateStore
 }
 
 // NewService builds the probe service.
@@ -565,6 +566,30 @@ func (s *Service) runAutomaticCycle(ctx context.Context) {
 	s.logger.Info("account_probe_cycle_start", "page", page, "chunk", len(candidates), "total", total)
 }
 
+// SetStateStore wires the on-disk progress file and restores the sweep cursor.
+func (s *Service) SetStateStore(path string) error {
+	s.state = newStateStore(path)
+	if path == "" {
+		return nil
+	}
+	value, found, err := s.state.Load()
+	if err != nil {
+		return err
+	}
+	if !found {
+		return nil
+	}
+	s.mu.Lock()
+	if value.CursorPage > 0 {
+		s.cursorPage = value.CursorPage
+	}
+	s.mu.Unlock()
+	if value.CursorPage > 0 {
+		s.logger.Info("account_probe_cursor_restored", "page", value.CursorPage)
+	}
+	return nil
+}
+
 // nextCursorPage reports the page the next automatic cycle should probe.
 func (s *Service) nextCursorPage() int {
 	s.mu.RLock()
@@ -579,6 +604,10 @@ func (s *Service) recordCursorPage(page int) {
 	s.mu.Lock()
 	s.cursorPage = page
 	s.mu.Unlock()
+	// Persist outside the lock: a disk write must not stall a probe.
+	if err := s.state.Save(probeState{CursorPage: page}); err != nil {
+		s.logger.Warn("account_probe_cursor_persist_failed", "page", page, "error", err)
+	}
 }
 
 // Start launches a probe batch and returns immediately.

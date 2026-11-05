@@ -14,8 +14,8 @@ import (
 	"time"
 
 	accountapp "github.com/chenyme/grok2api/backend/internal/application/account"
-	accountsyncapp "github.com/chenyme/grok2api/backend/internal/application/accountsync"
 	accountprobeapp "github.com/chenyme/grok2api/backend/internal/application/accountprobe"
+	accountsyncapp "github.com/chenyme/grok2api/backend/internal/application/accountsync"
 	"github.com/chenyme/grok2api/backend/internal/application/adminauth"
 	auditapp "github.com/chenyme/grok2api/backend/internal/application/audit"
 	clientkeyapp "github.com/chenyme/grok2api/backend/internal/application/clientkey"
@@ -380,6 +380,11 @@ func New(ctx context.Context, cfg config.Config, logger *slog.Logger) (*Applicat
 	// failed load is not fatal: yaml defaults remain in force.
 	if probeConfigErr := accountProbeService.SetConfigStore(accountProbeConfigPath(qualityGuardDirectory)); probeConfigErr != nil {
 		logger.Warn("account_probe_config_load_failed", "error", probeConfigErr)
+	}
+	// The sweep cursor is persisted separately from the configuration: it is
+	// runtime progress, and losing it would restart the rotation from page one.
+	if probeStateErr := accountProbeService.SetStateStore(accountProbeStatePath(qualityGuardDirectory)); probeStateErr != nil {
+		logger.Warn("account_probe_state_load_failed", "error", probeStateErr)
 	}
 	inferenceConcurrency := httpmiddleware.NewConcurrencyGate(cfg.Server.MaxConcurrentRequests)
 	var notifySettings func(context.Context)

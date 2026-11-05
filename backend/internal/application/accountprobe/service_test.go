@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -333,5 +334,39 @@ func TestCalibrationIgnoresStaleSamples(t *testing.T) {
 	}
 	if !got.Calibrated {
 		t.Fatalf("expected calibrated, got warning %q", got.Warning)
+	}
+}
+
+// TestCursorSurvivesRestart guards the sweep progress. The rotating sweep only
+// reaches the tail of a large pool after many cycles, and the broken accounts
+// turned out to sit exactly there, so a restart that reset the cursor would leave
+// them unprobed forever.
+func TestCursorSurvivesRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "account-probe-state.json")
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	first := NewService(logger, nil, nil, &fakeLister{})
+	if err := first.SetStateStore(path); err != nil {
+		t.Fatalf("SetStateStore: %v", err)
+	}
+	first.recordCursorPage(7)
+
+	second := NewService(logger, nil, nil, &fakeLister{})
+	if err := second.SetStateStore(path); err != nil {
+		t.Fatalf("SetStateStore on restart: %v", err)
+	}
+	if got := second.nextCursorPage(); got != 7 {
+		t.Fatalf("cursor after restart = %d, want 7", got)
+	}
+}
+
+// TestCursorPersistFailureIsNotFatal covers an unwritable path: probing must keep
+// working, the cursor just stops advancing on disk.
+func TestCursorPersistFailureIsNotFatal(t *testing.T) {
+	service := NewService(slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil, &fakeLister{})
+	service.state = newStateStore(filepath.Join(t.TempDir(), "missing", "\x00bad"))
+	service.recordCursorPage(3)
+	if got := service.nextCursorPage(); got != 3 {
+		t.Fatalf("in-memory cursor = %d, want 3", got)
 	}
 }

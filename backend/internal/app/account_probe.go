@@ -27,6 +27,17 @@ func accountProbeConfigPath(qualityGuardDirectory string) string {
 	return filepath.Join(".", "data", "account-probe.json")
 }
 
+// accountProbeStatePath holds runtime progress (the sweep cursor) beside the
+// configuration. It is a separate file because it is not a setting: mixing a
+// cursor that changes every cycle into the document an operator edits would make
+// every panel save race the sweep.
+func accountProbeStatePath(qualityGuardDirectory string) string {
+	if directory := strings.TrimSpace(qualityGuardDirectory); directory != "" {
+		return filepath.Join(directory, "account-probe-state.json")
+	}
+	return filepath.Join(".", "data", "account-probe-state.json")
+}
+
 // accountProbeConfig maps the yaml block onto the runtime configuration. The
 // server-managed identity is the default funding key, so enabling the feature in
 // yaml is enough to make automatic cycles work without picking a Client Key.
