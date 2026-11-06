@@ -130,10 +130,19 @@ requestRetry:
 这个组合会把「慢」变成「503」，并且顺带大量禁用账号。建议：
 
 ```yaml
-    holdTimeout: 90s
     onExhausted: fail_open
     autoDisable: false
 ```
+
+**`holdTimeout` 不能调大。** 代码硬性限制在 200ms 到 30s 之间：
+
+```go
+if d := value.HoldTimeout.Value(); d != 0 && (d < 200*time.Millisecond || d > 30*time.Second) {
+    return errors.New("qualityGuard.requestRetry.holdTimeout 必须在 200ms 到 30s 之间")
+}
+```
+
+设成 90s 会让容器**启动即崩、无限重启**。应对「慢账号」只能靠 `fail_open`——超时后把已收到的内容发出去，而不是靠延长观察窗口。
 
 `autoDisable: false` 之后，禁用工作交给短测探针——它用固定题目、多次采样，比按真实流量判断更准（实测现有检测器标记的账号里约有一半是误报）。
 
