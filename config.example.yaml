@@ -198,8 +198,12 @@ qualityGuard:
   requestRetry:
     enabled: false
     maxAttempts: 6
+    # 实测：慢账号要 35 秒以上才产出内容。30s 会在内容到达前就判超时，
+    # 把「慢」变成「没有推理」。开启本功能时建议不低于 90s。
     holdTimeout: 30s
     minOutputTokens: 8
+    # fail_closed 会在超时后返回 503 而不是把已收到的内容发出去。
+    # 上游本身偶发空流时，这个组合会让用户看到全空。
     onExhausted: fail_closed # fail_open | fail_closed
     # Immediately disable an account on its first confirmed missing-thinking
     # or degraded output-speed hit (soft-TPS, hard-TPS, or buffered-burst).

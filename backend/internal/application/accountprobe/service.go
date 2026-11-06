@@ -6,6 +6,18 @@
 // so that every account is observed through the egress it is actually bound to.
 // This package only owns scheduling, concurrency, verdict bookkeeping and the
 // penalty hand-off.
+//
+// Three operational facts learned running this against a 6k account pool, each
+// of which cost real debugging time:
+//
+//   - The dominant failure is HTTP 200 carrying zero tokens. It is not a fast
+//     answer: the account spends 30s to minutes before producing nothing.
+//   - Broken accounts cluster at the low end of the id range, which is the tail
+//     of the sweep. The cursor therefore has to survive a restart, or the
+//     rotation begins at page one again and never reaches them.
+//   - Raising Workers above 2 while sweeping hundreds of accounts triggered
+//     upstream rate limiting (403 with account_scoped=false). Cover more ground
+//     with ChunkSize and Interval, never with concurrency.
 package accountprobe
 
 import (
