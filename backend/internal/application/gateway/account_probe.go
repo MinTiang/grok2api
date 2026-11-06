@@ -507,9 +507,11 @@ func (s *Service) ProbeAccount(ctx context.Context, input AccountProbeInput) (Ac
 // The encrypted/payload thinking bytes are the only trustworthy evidence, so TPS
 // is recorded for diagnostics and never decides the verdict.
 func classifyAccountProbeResult(result AccountProbeResult) (string, string) {
-	if result.HasThinking {
-		return AccountProbeHealthy, "thinking_present"
-	}
+	// An answer with no visible output is checked before HasThinking, because
+	// HasThinking is satisfied by any reasoning payload at all. A degraded account
+	// emits a twenty-byte reasoning stub and then nothing; that stub used to
+	// short-circuit this function into a healthy verdict, which is how an account
+	// with twenty-six empty replies in real traffic passed every probe.
 	if result.VisibleChars == 0 && result.OutputTokens == 0 {
 		// A 2xx carrying nothing at all is the headline symptom: the account
 		// accepted the request, spent seconds on it, and streamed no tokens. Real
@@ -520,6 +522,9 @@ func classifyAccountProbeResult(result AccountProbeResult) (string, string) {
 			return AccountProbeHard, "empty_reply"
 		}
 		return AccountProbeError, "empty_reply"
+	}
+	if result.HasThinking {
+		return AccountProbeHealthy, "thinking_present"
 	}
 	return AccountProbeHard, "thinking_missing"
 }

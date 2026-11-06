@@ -254,3 +254,35 @@ func TestEmptySuccessReplyIsDegraded(t *testing.T) {
 		t.Fatalf("prose without reasoning = %q, want %q", got, AccountProbeHard)
 	}
 }
+
+// TestReasoningStubWithoutAnswerIsDegraded pins the hole that let a badly broken
+// account through. A degraded upstream emits a tiny reasoning stub and no answer
+// at all; because HasThinking was tested first, that stub produced a healthy
+// verdict. One such account had twenty-six empty replies in real traffic and
+// passed every sweep.
+func TestReasoningStubWithoutAnswerIsDegraded(t *testing.T) {
+	stub := AccountProbeResult{
+		StatusCode:     200,
+		HasThinking:    true,
+		ReasoningBytes: 20,
+		VisibleChars:   0,
+		OutputTokens:   0,
+	}
+	if got, reason := classifyAccountProbeResult(stub); got != AccountProbeHard || reason != "empty_reply" {
+		t.Fatalf("reasoning stub with no answer = %q (%s), want hard/empty_reply", got, reason)
+	}
+
+	// Real thinking plus a real answer is still healthy.
+	good := AccountProbeResult{
+		StatusCode: 200, HasThinking: true, ReasoningBytes: 380, VisibleChars: 3, OutputTokens: 5,
+	}
+	if got, _ := classifyAccountProbeResult(good); got != AccountProbeHealthy {
+		t.Fatalf("thinking with an answer = %q, want healthy", got)
+	}
+
+	// Thinking with an answer but no reasoning is still the ratio case.
+	noReasoning := AccountProbeResult{StatusCode: 200, VisibleChars: 40, OutputTokens: 48}
+	if got, _ := classifyAccountProbeResult(noReasoning); got != AccountProbeHard {
+		t.Fatalf("prose without reasoning = %q, want hard", got)
+	}
+}
